@@ -28,3 +28,4 @@ Dashboard:
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn app.dashboard.main:app --reload
 ```
+https://supabase.com/dashboard/join?token=bqo8x-ulkct-q6lbo-ovx68&slug=oggldajzryhcrfjdenyg
