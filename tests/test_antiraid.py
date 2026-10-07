@@ -47,3 +47,9 @@ async def test_memory_join_store_excludes_current_join_from_history() -> None:
     assert len(previous) == 1
     assert len(previous_new) == 1
     assert previous_users == [1]
+
+
+def test_merge_lockdown_guild_ids_includes_pending_retries_without_duplicates() -> None:
+    from app.services.antiraid import merge_lockdown_guild_ids
+
+    assert merge_lockdown_guild_ids([123, 456], [456, 789]) == [123, 456, 789]

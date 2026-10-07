@@ -1,3 +1,4 @@
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,7 +59,7 @@ def test_testall_checks_actual_economy_result() -> None:
     assert "expected_wallet = 40" in source
     assert "expected_bank = 30" in source
     assert "inventory_quantity == 1" in source
-    assert "loaded_item.stock == 3" in source
+    assert "loaded_stock_value == 4" in source
 
 
 def test_testall_includes_interaction_safety_and_poll_validation() -> None:
@@ -226,6 +227,13 @@ def test_testall_includes_remote_command_sync() -> None:
     assert "async def _remote_command_sync_check" in source
     assert "results.append(await _remote_command_sync_check(bot, guild_id))" in source
 
+def test_external_command_groups_are_replaced_with_current_definitions() -> None:
+    admin_source = Path("app/discord/cogs/admin.py").read_text(encoding="utf-8")
+    raid_source = Path("app/discord/cogs/antiraid.py").read_text(encoding="utf-8")
+    assert "bot.tree.add_command(admin_group, override=True)" in admin_source
+    assert "bot.tree.add_command(raid_group, override=True)" in raid_source
+
+
 def test_development_command_sync_is_guild_scoped() -> None:
     source = Path("app/discord/bot.py").read_text(encoding="utf-8")
     assert "self.tree.copy_global_to(guild=guild_object)" in source
@@ -238,7 +246,7 @@ def test_discord_guild_id_is_configurable() -> None:
 
 def test_remote_command_sync_ignores_group_nodes() -> None:
     source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
-    assert 'if not hasattr(command, "commands")' in source
+    assert 'if not getattr(command, "commands", None)' in source
 
 def test_channel_activity_is_in_sequence_alignment() -> None:
     source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
@@ -401,3 +409,446 @@ def test_tree_error_handler_is_installed() -> None:
 def test_message_logging_call_supplies_message_id() -> None:
     source = (Path(__file__).resolve().parents[1] / "app" / "repositories" / "analytics.py").read_text(encoding="utf-8")
     assert "message_id=message_id" in source
+
+
+
+def test_app_command_group_registration_replaces_stale_definitions() -> None:
+    for relative, group_name in (
+        ("app/discord/cogs/admin.py", "admin_group"),
+        ("app/discord/cogs/automod.py", "automod_group"),
+        ("app/discord/cogs/antiraid.py", "raid_group"),
+    ):
+        source = Path(relative).read_text(encoding="utf-8")
+        assert f"bot.tree.add_command({group_name}, override=True)" in source
+
+
+def test_reward_claim_insert_and_wallet_credit_share_savepoint() -> None:
+    source = Path("app/services/rewards.py").read_text(encoding="utf-8")
+    start = source.index("    try:\n        async with session.begin_nested():", source.index("async def claim_reward"))
+    end = source.index("    except IntegrityError", start)
+    block = source[start:end]
+    assert "session.add(RewardClaim(" in block
+    assert "await session.flush()" in block
+    assert "await add_wallet(" in block
+
+
+def test_dashboard_rejects_invalid_timezone_and_updates_timestamp() -> None:
+    source = Path("app/dashboard/main.py").read_text(encoding="utf-8")
+    assert "ZoneInfo(timezone_name)" in source
+    assert 'raise HTTPException(status_code=422, detail="Invalid timezone")' in source
+    assert "settings_row.updated_at = datetime.now(timezone.utc)" in source
+
+
+def test_activity_endpoint_scopes_top_channels_to_requested_period() -> None:
+    source = Path("app/dashboard/main.py").read_text(encoding="utf-8")
+    assert 'top_channels(session, guild_id, "messages", days=days)' in source
+
+
+@pytest.mark.asyncio
+async def test_claim_reward_maps_unique_race_to_cooldown(monkeypatch) -> None:
+    from decimal import Decimal
+    from sqlalchemy.exc import IntegrityError
+    from app.core.exceptions import CooldownActive
+    from app.services import rewards
+
+    class Result:
+        def scalar_one_or_none(self):
+            return None
+
+    class Nested:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class Session:
+        def __init__(self):
+            self.added = []
+            self.flushes = 0
+        async def get(self, *_args, **_kwargs):
+            return None
+        async def execute(self, *_args, **_kwargs):
+            return Result()
+        def add(self, value):
+            self.added.append(value)
+        def begin_nested(self):
+            return Nested()
+        async def flush(self):
+            self.flushes += 1
+            raise IntegrityError("insert", {}, RuntimeError("duplicate"))
+
+    credited = False
+    async def fake_add_wallet(*_args, **_kwargs):
+        nonlocal credited
+        credited = True
+
+    monkeypatch.setattr(rewards, "add_wallet", fake_add_wallet)
+    session = Session()
+    with pytest.raises(CooldownActive):
+        await rewards.claim_reward(session, 1, 2, "daily", Decimal("50.00"))
+    assert session.flushes == 1
+    assert credited is False
+
+
+
+def test_dashboard_automod_errors_are_escaped() -> None:
+    source = Path("app/dashboard/static/app.js").read_text(encoding="utf-8")
+    assert "automodRules.innerHTML=`<p>${esc(error.message)}</p>`" in source
+    assert "automodRules.innerHTML=`<p>${error.message}</p>`" not in source
+
+
+def test_giveaway_reroll_keeps_full_winner_history() -> None:
+    source = Path("app/discord/cogs/community.py").read_text(encoding="utf-8")
+    start = source.index("async def giveaway_reroll")
+    end = source.index('async def giveaway_cancel', start)
+    block = source[start:end]
+    assert 'safe_int_list((giveaway.requirements or {}).get("winner_ids", []), 10_000)' in block
+
+
+def test_antiraid_disable_retries_pending_lockdown_cleanup() -> None:
+    source = Path("app/discord/cogs/antiraid.py").read_text(encoding="utf-8")
+    start = source.index('async def disable')
+    end = source.index('async def configure', start)
+    block = source[start:end]
+    assert 'pending = await self.lockdown_pending_count(interaction.guild.id)' in block
+    assert 'if pending:' in block
+    assert 'row.active_until = utc_now()' in block
+
+
+def test_dashboard_rejects_corrupt_redis_session_payload() -> None:
+    source = Path("app/dashboard/main.py").read_text(encoding="utf-8")
+    start = source.index('async def get_dashboard_token')
+    end = source.index('async def session_guilds', start)
+    block = source[start:end]
+    assert 'except (TypeError, ValueError):' in block
+    assert 'request.session.clear()' in block
+    assert 'isinstance(data, dict)' in block
+
+
+def test_dashboard_imports_guild_model_used_by_session_guilds() -> None:
+    source = Path("app/dashboard/main.py").read_text(encoding="utf-8")
+    import_line = next(line for line in source.splitlines() if line.startswith("from app.models import "))
+    assert "Guild" in import_line
+    assert "select(Guild.id)" in source
+
+
+def test_community_imports_status_line_used_by_commands() -> None:
+    source = Path("app/discord/cogs/community.py").read_text(encoding="utf-8")
+    import_line = next(line for line in source.splitlines() if line.startswith("from app.discord.theme import "))
+    assert "status_line" in import_line
+    assert source.count("status_line(") >= 5
+
+
+def test_automod_rejects_non_finite_numeric_config() -> None:
+    source = Path("app/services/automod.py").read_text(encoding="utf-8")
+    assert "math.isfinite(float(value))" in source
+    assert "número finito" in source
+
+
+def test_automod_role_allowlists_ignore_malformed_ids() -> None:
+    source = Path("app/services/automod.py").read_text(encoding="utf-8")
+    assert "except (TypeError, ValueError):" in source
+    assert source.count("int(value) in context.role_ids") >= 2
+
+
+def test_community_end_operations_require_active_state() -> None:
+    source = Path("app/services/community.py").read_text(encoding="utf-8")
+    giveaway = source[source.index("async def end_giveaway"):source.index("async def add_poll_vote", source.index("async def end_giveaway"))]
+    poll = source[source.index("async def end_poll"):source.index("async def open_items", source.index("async def end_poll"))]
+    assert 'if giveaway.status != "active":' in giveaway
+    assert 'if poll.status != "active":' in poll
+
+
+def test_bot_member_sync_preserves_banner_and_identity_fields() -> None:
+    source = Path("app/discord/bot.py").read_text(encoding="utf-8")
+    assert "member.banner.url if member.banner else None, member.bot" in source
+    assert "message.author.banner.url if message.author.banner else None, message.author.bot" in source
+
+
+def test_automod_validates_suspicious_weights_and_similarity_min_length() -> None:
+    source = Path("app/services/automod.py").read_text(encoding="utf-8")
+    assert '"new_account_weight", "new_member_weight", "invite_weight", "link_weight", "mention_weight", "activity_weight"' in source
+    assert '"min_length"' in source
+    assert "math.isfinite(float(value))" in source
+
+
+def test_dashboard_automod_create_normalizes_name_and_handles_race_conflicts() -> None:
+    source = Path("app/dashboard/main.py").read_text(encoding="utf-8")
+    start = source.index("async def create_automod_rule")
+    end = source.index("async def patch_automod_rule", start)
+    block = source[start:end]
+    assert 'name = " ".join(payload.name.split())' in block
+    assert 'if not name:' in block
+    assert 'func.lower(AutoModRule.name) == name.casefold()' in block
+    assert 'except IntegrityError:' in block
+
+
+def test_automod_kick_and_ban_are_persisted_in_moderation_history() -> None:
+    source = Path("app/discord/cogs/automod.py").read_text(encoding="utf-8")
+    start = source.index("    async def execute_action")
+    end = source.index('    @automod_group.command(name="enable"', start)
+    block = source[start:end]
+    assert 'record_punishment(session, message.guild.id, member.id' in block
+    assert '"kick"' in block and '"ban"' in block
+
+
+def test_embed_theme_removes_repetitive_branding_and_keeps_section_identity() -> None:
+    source = Path("app/discord/theme.py").read_text(encoding="utf-8")
+    assert "def _clean_title(title: str) -> str:" in source
+    assert 'if cleaned.upper().startswith("BN /"):' in source
+    assert 'result.set_author(name=f"BN Bot  ·  {section_label.upper()}")' in source
+    assert 'result.set_footer(text=f"BN Bot · {section_label}")' in source
+
+
+def test_help_panel_does_not_show_a_fake_full_progress_bar() -> None:
+    source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
+    assert 'name="Carga do módulo"' not in source
+    assert 'name=f"Disponíveis · {len(lines)}"' in source
+    assert 'name=f"{name} · {len(values)}"' in source
+
+
+def test_development_does_not_sync_commands_globally_from_setup_hook() -> None:
+    import ast
+
+    source = Path("app/discord/bot.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    setup = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "BNBot")
+    setup_hook = next(node for node in setup.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup_hook")
+    calls = [
+        ast.unparse(node)
+        for node in ast.walk(setup_hook)
+        if isinstance(node, ast.Call)
+    ]
+    assert not any(call == "self.tree.sync()" for call in calls)
+    ready = next(node for node in setup.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "on_ready")
+    assert "await self._sync_command_scopes()" in ast.unparse(ready)
+
+
+def test_development_command_sync_clears_stale_global_commands() -> None:
+    source = Path("app/discord/bot.py").read_text(encoding="utf-8")
+    start = source.index("async def _clear_global_commands")
+    end = source.index("async def _sync_guild_commands", start)
+    block = source[start:end]
+    assert "self.tree.clear_commands(guild=None)" in block
+    assert "await self.tree.sync()" in block
+    assert "for command in global_commands:" in block
+
+
+
+
+
+def test_remote_command_signatures_flattens_all_group_children_from_payload() -> None:
+    source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    start = source.index("def _remote_command_signatures")
+    end = source.index("async def _remote_command_sync_check", start)
+    block = source[start:end]
+    assert "data = command.to_dict()" in block
+    assert "if top_type == 2:" in block
+    assert "walk_options(options, top_name)" in block
+    assert 'result[qualified] = ("1", option_name, _remote_option_signature(nested))' in block
+
+def test_remote_command_parser_flattens_group_subcommands_from_exact_payload() -> None:
+    source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    start = source.index("def _remote_option_signature")
+    end = source.index("async def _remote_command_sync_check", start)
+    block = source[start:end]
+    assert "data = command.to_dict()" in block
+    assert "if top_type == 2:" in block
+    assert "walk_options(options, top_name)" in block
+    assert 'result[qualified] = ("1", option_name, _remote_option_signature(nested))' in block
+
+
+def test_module_level_group_commands_are_bound_to_their_cog_before_tree_registration() -> None:
+    for filename in ("admin.py", "automod.py", "antiraid.py"):
+        source = Path("app/discord/cogs") / filename
+        block = source.read_text(encoding="utf-8")
+        start = block.index("def add_to_tree")
+        section = block[start:]
+        assert "binding: commands.Cog | None = None" in section
+        assert "command._copy_with(parent=" in section
+        assert "binding=binding" in section
+        assert "bot.tree.add_command(" in section
+
+
+def test_setup_hook_passes_cog_bindings_to_module_level_groups() -> None:
+    source = Path("app/discord/bot.py").read_text(encoding="utf-8")
+    assert "add_to_tree(self, admin_cog)" in source
+    assert "add_automod_to_tree(self, automod_cog)" in source
+    assert "add_antiraid_to_tree(self, antiraid_cog)" in source
+
+def test_command_serialization_passes_command_tree() -> None:
+    source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    assert "payload = command.to_dict(bot.tree)" in source
+    assert "data = command.to_dict(tree)" in source
+
+
+def test_command_source_safety_unparses_ast_callable_nodes() -> None:
+    source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    assert "def _called_name(node: ast.AST) -> str:" in source
+    assert "return ast.unparse(node)" in source
+    assert "name = _called_name(call.func)" in source
+
+
+def test_xp_diagnostic_snapshots_first_row_before_second_add() -> None:
+    source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    assert "first_row_total = row.total_xp if row is not None else None" in source
+    assert "first_row_level = row.level if row is not None else None" in source
+    assert "first_row_total == 101 and first_row_level == 1" in source
+
+
+def test_analytics_diagnostic_counts_message_logs_with_sqlalchemy_in_clause() -> None:
+    source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    assert "MessageLog.id.in_([first_message, second_message])" in source
+    assert "from app.models import ChannelActivity, EconomyAccount, Experience, Giveaway, GuildSettings, Member, MessageLog" in source
+
+
+def test_discord_command_diagnostic_checks_global_and_guild_scopes() -> None:
+    source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    assert "global_remote = await bot.tree.fetch_commands()" in source
+    assert "comandos globais antigos" in source
+    assert "comandos de guilda antigos" in source
+
+
+def test_help_select_does_not_use_static_custom_id() -> None:
+    source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
+    assert 'custom_id="bn:help:category"' not in source
+
+
+def test_remote_command_type_supports_discord_enum_values() -> None:
+    source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    assert "def _enum_int(value: Any, default: int = 0) -> int:" in source
+    assert 'raw = getattr(value, "value", value)' in source
+
+
+def test_analytics_smoke_flushes_and_uses_unique_probe_ids() -> None:
+    source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    assert "probe_user_id = secrets.randbits(50)" in source
+    assert "probe_channel_id = secrets.randbits(50)" in source
+    assert "await session.flush()" in source[source.index('async def _analytics_smoke'):source.index('def _automod_smoke')]
+
+
+def test_ban_action_has_custom_gavel_media() -> None:
+    source = Path("app/discord/cogs/moderation.py").read_text(encoding="utf-8")
+    assert '"gavel-ban.gif"' in source
+    assert 'attachment://gavel-ban.gif' in source
+
+
+def test_critical_admin_commands_defer_before_any_work() -> None:
+    import ast
+    for name in ("credit", "debit", "shop_add", "job_add", "timezone"):
+        source = Path("app/discord/cogs/admin.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(item for item in ast.walk(tree) if isinstance(item, ast.AsyncFunctionDef) and item.name == name)
+        calls = sorted((item for stmt in node.body for item in ast.walk(stmt) if isinstance(item, ast.Call)), key=lambda item: item.lineno)
+        defer_line = next(item.lineno for item in calls if ast.unparse(item.func).split(".")[-1] == "defer")
+        assert defer_line == calls[0].lineno
+
+
+def test_antiraid_critical_commands_start_with_defer() -> None:
+    import ast
+    source = Path("app/discord/cogs/antiraid.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for name in ("setup", "enable", "disable"):
+        node = next(item for item in ast.walk(tree) if isinstance(item, ast.AsyncFunctionDef) and item.name == name)
+        calls = sorted((item for stmt in node.body for item in ast.walk(stmt) if isinstance(item, ast.Call)), key=lambda item: item.lineno)
+        defer_line = next(item.lineno for item in calls if ast.unparse(item.func).split(".")[-1] == "defer")
+        assert defer_line == calls[0].lineno
+
+
+def test_help_categorizes_ticket_leaf_commands_as_community() -> None:
+    source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
+    start = source.index('async def help')
+    block = source[start:source.index('categories =', start)]
+    for name in ("ticket-close", "ticket-reopen", "ticket-claim", "ticket-config"):
+        assert f'"{name}"' in block
+
+
+def test_automod_timeout_does_not_persist_when_author_is_not_a_member() -> None:
+    source = Path("app/discord/cogs/automod.py").read_text(encoding="utf-8")
+    start = source.index('if action == "timeout":')
+    end = source.index('if action == "kick":', start)
+    block = source[start:end]
+    assert 'if member is None:' in block
+    assert 'raise ValidationFailure("Não foi possível aplicar timeout neste autor.")' in block
+    assert 'record_punishment(session, message.guild.id, member.id' in block
+
+
+def test_dashboard_fetches_uncached_members_and_users() -> None:
+    source = Path("app/discord/cogs/dashboard.py").read_text(encoding="utf-8")
+    assert 'member = await guild.fetch_member(object_id)' in source
+    assert 'user = await interaction.client.fetch_user(object_id)' in source
+
+
+def test_dashboard_confirms_mutating_security_and_admin_commands() -> None:
+    source = Path("app/discord/cogs/dashboard.py").read_text(encoding="utf-8")
+    start = source.index('CONFIRM_COMMANDS =')
+    end = source.index('OPTION_PLACEHOLDERS', start)
+    block = source[start:end]
+    for name in ("admin credit", "admin shop-add", "admin job-add", "automod rule-update", "antiraid configure"):
+        assert f'"{name}"' in block
+
+
+def test_dashboard_confirmation_disables_old_view_after_execution() -> None:
+    source = Path("app/discord/cogs/dashboard.py").read_text(encoding="utf-8")
+    assert "await interaction.edit_original_response(view=None)" in source
+    assert "await interaction.message.edit(view=None)" not in source
+
+
+def test_dashboard_parameter_panel_has_back_navigation() -> None:
+    source = Path("app/discord/cogs/dashboard.py").read_text(encoding="utf-8")
+    assert 'label="Voltar"' in source
+    assert "command_category(self.command.qualified_name)" in source
+
+
+def test_remind_rejects_oversized_messages_instead_of_truncating() -> None:
+    source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
+    start = source.index("async def remind")
+    end = source.index('@app_commands.command(name="help"', start)
+    block = source[start:end]
+    assert "if len(text) > 2000:" in block
+    assert "O lembrete pode ter no máximo 2000 caracteres." in block
+
+
+def test_command_matrix_has_an_exact_expected_command_inventory() -> None:
+    from app.services.command_matrix import EXPECTED_COMMANDS, audit_commands
+    actual = {case.qualified_name for case in audit_commands()}
+    assert actual == EXPECTED_COMMANDS
+    assert len(actual) == 76
+
+
+def test_testall_uses_one_ephemeral_message_with_embed_pages() -> None:
+    source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
+    start = source.index('async def testall')
+    block = source[start:]
+    assert "class TestallView(discord.ui.View):" in source
+    assert "await interaction.edit_original_response(embed=pages[0], view=view)" in block
+    assert "interaction.followup.send" not in block
+    assert "self.page_button.label = f\"{self.page_index + 1} / {total}\"" in source
+    assert 'label="Anterior"' in source
+    assert 'label="Próxima"' in source
+    assert 'label="Primeira"' in source
+    assert 'label="Última"' in source
+
+
+def test_project_python_source_has_no_comments() -> None:
+    import io
+    import tokenize
+    root = Path(".")
+    comments = []
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type == tokenize.COMMENT:
+                comments.append(f"{path}:{token.start[0]}")
+    assert comments == []
+
+def test_project_frontend_source_has_no_comment_blocks() -> None:
+    root = Path("app")
+    comments = []
+    for pattern, markers in (("*.js", ("//", "/*", "*/")), ("*.css", ("/*", "*/")), ("*.html", ("<!--", "-->"))):
+        for path in root.rglob(pattern):
+            text = path.read_text(encoding="utf-8")
+            for marker in markers:
+                if marker in text:
+                    comments.append(f"{path}:{marker}")
+    assert comments == []

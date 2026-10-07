@@ -90,3 +90,40 @@ def test_matching_same_type_rule_keeps_highest_priority_rule() -> None:
 def test_domain_whitelist_allows_invite_domain() -> None:
     result = evaluate_rules([rule(1, "invite")], context("https://discord.gg/test"), whitelist_entries=[{"entry_type": "domain", "value": "discord.gg"}])
     assert not result.matched
+
+
+def test_suspicious_threshold_accepts_score_range() -> None:
+    assert not validate_rule_config("suspicious", {"threshold": 60})
+
+
+def test_malformed_whitelist_role_does_not_crash_evaluation() -> None:
+    result = evaluate_rules([rule(1, "caps", config={"min_letters": 10, "ratio": 0.75})], context("THIS IS VERY LOUD"), whitelist_entries=[{"entry_type": "role", "value": "invalid"}])
+    assert result.action == "delete"
+
+
+def test_validate_rule_config_rejects_invalid_suspicious_weights() -> None:
+    from app.services.automod import validate_rule_config
+    errors = validate_rule_config("suspicious", {"new_account_weight": -1, "mention_trigger": 0, "activity_weight": 101})
+    assert errors
+
+
+def test_validate_rule_config_rejects_invalid_similarity_min_length_and_nan() -> None:
+    from app.services.automod import validate_rule_config
+    errors = validate_rule_config("similarity", {"min_length": 0, "threshold": float("nan")})
+    assert any("min_length" in error for error in errors)
+    assert any("threshold" in error for error in errors)
+
+
+def test_domain_whitelist_overrides_blocked_domain_and_www_subdomain() -> None:
+    rules = [rule(1, "link", config={"block_all": True, "blocked_domains": ["example.com"]})]
+    allowed = [{"entry_type": "domain", "value": "example.com"}]
+    result = evaluate_rules(rules, context("https://www.example.com/path"), whitelist_entries=allowed)
+    assert not result.matched
+
+
+def test_invite_domain_whitelist_requires_matching_domain() -> None:
+    rules = [rule(1, "invite")]
+    blocked = evaluate_rules(rules, context("https://discord.gg/test"), whitelist_entries=[{"entry_type": "domain", "value": "example.com"}])
+    allowed = evaluate_rules(rules, context("https://discord.gg/test"), whitelist_entries=[{"entry_type": "domain", "value": "discord.gg"}])
+    assert blocked.action == "delete"
+    assert not allowed.matched

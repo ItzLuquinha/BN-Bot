@@ -12,19 +12,19 @@ from typing import Any
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from app.core.db import get_engine, session_factory
 from app.config import get_settings
 from app.core.redis import redis_client
 from app.core.time import utc_now
-from app.models import ChannelActivity, EconomyAccount, Experience, Giveaway, GuildSettings, Member, Poll, Reminder, Report, ShopItem, Suggestion, Ticket, UserJob
+from app.models import ChannelActivity, EconomyAccount, Experience, Giveaway, GuildSettings, Member, MessageLog, Poll, Reminder, Report, ShopItem, Suggestion, Ticket, UserJob
 from app.repositories.economy import add_wallet, buy_item, get_or_create_account, move_bank_to_wallet, move_wallet_to_bank, sell_item, transfer
 from app.repositories.guilds import ensure_guild, ensure_user
 from app.services.antiraid import JoinContext, calculate_risk
 from app.services.automod import MessageContext, RuleDefinition, evaluate_rules, validate_rule_config
 from app.services.community import add_poll_vote, cast_suggestion_vote, create_ticket, end_giveaway, end_poll, enter_giveaway, save_ticket_transcript, set_ticket_status, validate_poll_options
-from app.services.cooldowns import check_and_set
+from app.services.cooldowns import check_and_set, release
 from app.services.levels import add_xp, level_from_xp, required_xp
 from app.services.rewards import claim_reward
 
@@ -128,6 +128,7 @@ REQUIRED_COMMANDS = {
     "avatar",
     "help",
     "testall",
+    "dashboard",
     "remind",
     "balance",
     "bank",
@@ -230,6 +231,36 @@ def _python_runtime_check() -> DiagnosticResult:
         return DiagnosticResult("Python runtime", False, f"{type(exc).__name__}: {str(exc)[:220]}")
 
 
+def _command_matrix_check() -> DiagnosticResult:
+    try:
+        from app.services.command_matrix import audit_summary
+        ok, cases, issues = audit_summary()
+        if not ok:
+            return DiagnosticResult("Command matrix", False, " | ".join(issues[:8]))
+        return DiagnosticResult("Command matrix", True, f"{len(cases)}/{len(cases)} comandos auditados individualmente: resposta, defer, escopo e contrato funcional")
+    except Exception as exc:
+        return DiagnosticResult("Command matrix", False, f"{type(exc).__name__}: {str(exc)[:220]}")
+
+
+def _command_matrix_details() -> list[DiagnosticResult]:
+    try:
+        from app.services.command_matrix import audit_commands, case_issues
+        results: list[DiagnosticResult] = []
+        for case in audit_commands():
+            issues = case_issues(case)
+            status = "OK" if not issues else "falha: " + "; ".join(issues)
+            scope = "guild" if case.guild_only else "DM/guild"
+            result = DiagnosticResult(
+                f"CMD /{case.qualified_name}",
+                not issues,
+                f"{case.file}:{case.function} | params={case.parameter_count} | escopo={scope} | resposta={'OK' if case.response_path else 'ausente'} | defer={'OK' if case.defer_before_io else 'falha'} | {status}",
+            )
+            results.append(result)
+        return results
+    except Exception as exc:
+        return [DiagnosticResult("Command matrix details", False, f"{type(exc).__name__}: {str(exc)[:220]}")]
+
+
 def _command_check(bot: Any) -> DiagnosticResult:
     command_objects = list(bot.tree.walk_commands())
     leaf_commands = [command for command in command_objects if not getattr(command, "commands", None)]
@@ -294,12 +325,25 @@ def _is_command_callback(node: ast.AsyncFunctionDef | ast.FunctionDef) -> bool:
     return False
 
 
-def _called_name(call: ast.Call) -> str:
-    return ast.unparse(call.func)
+def _called_name(node: ast.AST) -> str:
+    return ast.unparse(node)
+
+
+def _is_defer_call(call: ast.Call) -> bool:
+    name = _called_name(call.func)
+    return name == "defer" or name == "interaction.response.defer" or name.endswith(".defer")
+
+
+def _enum_int(value: Any, default: int = 0) -> int:
+    raw = getattr(value, "value", value)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 def _is_io_call(call: ast.Call) -> bool:
-    name = _called_name(call)
+    name = _called_name(call.func)
     if name == "session_factory" or name.startswith("redis_client.") or name.endswith("check_and_set"):
         return True
     if name.startswith("session."):
@@ -327,7 +371,7 @@ def _interaction_safety_check() -> DiagnosticResult:
             if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) or not _is_command_callback(node):
                 continue
             calls = sorted((call for call in ast.walk(node) if isinstance(call, ast.Call)), key=lambda item: item.lineno)
-            defer_lines = [call.lineno for call in calls if _called_name(call) in {"defer", "interaction.response.defer", "self.defer"}]
+            defer_lines = [call.lineno for call in calls if _is_defer_call(call)]
             first_defer = min(defer_lines) if defer_lines else None
             direct_response_after = [call.lineno for call in calls if _called_name(call) in {"interaction.response.send_message", "interaction.response.edit_message"} and first_defer is not None and call.lineno > first_defer]
             duplicate_defers = defer_lines[1:]
@@ -431,7 +475,7 @@ def _command_serialization_check(bot: Any) -> DiagnosticResult:
         issues: list[str] = []
         for command in bot.tree.walk_commands():
             try:
-                payload = command.to_dict()
+                payload = command.to_dict(bot.tree)
             except Exception as exc:
                 issues.append(f"{command.qualified_name}: {type(exc).__name__}")
                 continue
@@ -729,10 +773,7 @@ async def _redis_checks(results: list[DiagnosticResult], guild_id: int) -> None:
         key = _redis_key("cooldown", guild_id)
         first = await check_and_set(key, 3)
         second = await check_and_set(key, 3)
-        try:
-            await redis_client.delete(key)
-        except Exception:
-            pass
+        await release(key)
         ok = first is None and second is not None
         results.append(DiagnosticResult("Cooldown", ok, "set inicial e bloqueio subsequente OK" if ok else "cooldown não bloqueou a segunda tentativa"))
     except Exception as exc:
@@ -767,9 +808,13 @@ async def _economy_smoke(guild_id: int, diagnostic_user_id: int) -> DiagnosticRe
                 funds_rejected = True
             expected_wallet = 40
             expected_bank = 30
-            ok = account.wallet == expected_wallet and account.bank == expected_bank and receiver.wallet == 15 and inventory_quantity == 1 and loaded_item is not None and loaded_item.stock == 3 and funds_rejected
+            wallet_value = account.wallet
+            bank_value = account.bank
+            receiver_wallet_value = receiver.wallet
+            loaded_stock_value = loaded_item.stock if loaded_item is not None else None
+            ok = wallet_value == expected_wallet and bank_value == expected_bank and receiver_wallet_value == 15 and inventory_quantity == 1 and loaded_item is not None and loaded_stock_value == 4 and funds_rejected
             await session.rollback()
-        return DiagnosticResult("Economia", ok, "carteira, banco, transferência, compra, venda, estoque e bloqueio de saldo insuficiente OK em rollback" if ok else f"estado inesperado: wallet={account.wallet} bank={account.bank} receiver={receiver.wallet} inventory={inventory_quantity}" )
+        return DiagnosticResult("Economia", ok, "carteira, banco, transferência, compra, venda, estoque e bloqueio de saldo insuficiente OK em rollback" if ok else f"estado inesperado: wallet={wallet_value} bank={bank_value} receiver={receiver_wallet_value} inventory={inventory_quantity} stock={loaded_stock_value}" )
     except Exception as exc:
         return DiagnosticResult("Economia", False, f"{type(exc).__name__}: {str(exc)[:220]}")
 
@@ -783,8 +828,10 @@ async def _progression_smoke(guild_id: int, diagnostic_user_id: int) -> Diagnost
             await ensure_user(session, diagnostic_user_id, str(diagnostic_user_id), str(diagnostic_user_id))
             total_xp, level, leveled = await add_xp(session, guild_id, diagnostic_user_id, 101)
             row = await session.scalar(select(Experience).where(Experience.guild_id == guild_id, Experience.user_id == diagnostic_user_id))
+            first_row_total = row.total_xp if row is not None else None
+            first_row_level = row.level if row is not None else None
             second_total, second_level, second_leveled = await add_xp(session, guild_id, diagnostic_user_id, 399)
-            ok = monotonic and level_formula and total_xp == 101 and level == 1 and leveled and row is not None and row.total_xp == 101 and row.level == 1 and second_total == 500 and second_level == 2 and second_leveled
+            ok = monotonic and level_formula and total_xp == 101 and level == 1 and leveled and row is not None and first_row_total == 101 and first_row_level == 1 and second_total == 500 and second_level == 2 and second_leveled
             await session.rollback()
         return DiagnosticResult("XP", ok, "fórmula, flush, criação da linha, persistência, level up e progressão de segundo nível OK em rollback" if ok else f"progressão retornou estado inesperado: total={second_total} level={second_level} leveled={second_leveled}")
     except Exception as exc:
@@ -862,15 +909,19 @@ async def _analytics_smoke(guild_id: int, diagnostic_user_id: int) -> Diagnostic
     try:
         from app.repositories.analytics import record_message
         async with session_factory() as session:
+            probe_user_id = secrets.randbits(50)
+            probe_channel_id = secrets.randbits(50)
             await ensure_guild(session, guild_id, f"Guild {guild_id}")
+            await ensure_user(session, probe_user_id, f"diagnostic-{probe_user_id}", f"Diagnostic {probe_user_id}", None, None, False)
             bucket = utc_now().replace(minute=0, second=0, microsecond=0)
             first_message = secrets.randbits(62)
             second_message = secrets.randbits(62)
-            await record_message(session, guild_id, diagnostic_user_id, 1, first_message, 10, bucket)
-            await record_message(session, guild_id, diagnostic_user_id, 1, second_message, 12, bucket)
-            member_value = int(await session.scalar(text("SELECT value FROM member_activity WHERE guild_id = :guild_id AND user_id = :user_id AND bucket_start = :bucket_start AND metric = 'messages'"), {"guild_id": guild_id, "user_id": diagnostic_user_id, "bucket_start": bucket}) or 0)
-            channel_value = int(await session.scalar(text("SELECT value FROM channel_activity WHERE guild_id = :guild_id AND channel_id = 1 AND bucket_start = :bucket_start AND metric = 'messages'"), {"guild_id": guild_id, "bucket_start": bucket}) or 0)
-            message_rows = int(await session.scalar(text("SELECT count(*) FROM message_logs WHERE guild_id = :guild_id AND id IN (:first_message, :second_message)"), {"guild_id": guild_id, "first_message": first_message, "second_message": second_message}) or 0)
+            await record_message(session, guild_id, probe_user_id, probe_channel_id, first_message, 10, bucket)
+            await record_message(session, guild_id, probe_user_id, probe_channel_id, second_message, 12, bucket)
+            await session.flush()
+            member_value = int(await session.scalar(text("SELECT value FROM member_activity WHERE guild_id = :guild_id AND user_id = :user_id AND bucket_start = :bucket_start AND metric = 'messages'"), {"guild_id": guild_id, "user_id": probe_user_id, "bucket_start": bucket}) or 0)
+            channel_value = int(await session.scalar(text("SELECT value FROM channel_activity WHERE guild_id = :guild_id AND channel_id = :channel_id AND bucket_start = :bucket_start AND metric = 'messages'"), {"guild_id": guild_id, "channel_id": probe_channel_id, "bucket_start": bucket}) or 0)
+            message_rows = int(await session.scalar(select(func.count(MessageLog.id)).where(MessageLog.guild_id == guild_id, MessageLog.id.in_([first_message, second_message]))) or 0)
             ok = member_value == 2 and channel_value == 2 and message_rows == 2
             await session.rollback()
         return DiagnosticResult("Analytics", ok, "atividade de membro, atividade de canal e message logs com upsert seguro em rollback" if ok else f"analytics inconsistente: member={member_value} channel={channel_value} logs={message_rows}")
@@ -900,6 +951,29 @@ def _antiraid_smoke(guild_id: int, user_id: int) -> DiagnosticResult:
         return DiagnosticResult("Anti-Raid", ok, "janela, threshold e score de risco OK" if ok else "motor de risco retornou estado inesperado")
     except Exception as exc:
         return DiagnosticResult("Anti-Raid", False, f"{type(exc).__name__}: {str(exc)[:220]}")
+
+
+def _runtime_regression_check() -> DiagnosticResult:
+    try:
+        issues: list[str] = []
+        group_sources = {
+            "app/discord/cogs/admin.py": "admin_group",
+            "app/discord/cogs/automod.py": "automod_group",
+            "app/discord/cogs/antiraid.py": "raid_group",
+        }
+        for relative, group_name in group_sources.items():
+            source = (_project_root() / relative).read_text(encoding="utf-8")
+            if f"if bot.tree.get_command({group_name}.name) is None:" not in source:
+                issues.append(f"registro duplicável: {relative}")
+        rewards_source = (_project_root() / "app/services/rewards.py").read_text(encoding="utf-8")
+        start = rewards_source.find("    try:\n        async with session.begin_nested():", rewards_source.find("async def claim_reward"))
+        end = rewards_source.find("    except IntegrityError", start) if start >= 0 else -1
+        block = rewards_source[start:end] if start >= 0 and end >= 0 else ""
+        if "session.add(RewardClaim(" not in block or "await session.flush()" not in block or "await add_wallet(" not in block:
+            issues.append("reward claim fora do savepoint de integridade")
+        return DiagnosticResult("Regressões runtime", not issues, "registro de grupos e recompensa idempotentes" if not issues else " | ".join(issues))
+    except Exception as exc:
+        return DiagnosticResult("Regressões runtime", False, f"{type(exc).__name__}: {str(exc)[:220]}")
 
 
 def _transaction_safety_check() -> DiagnosticResult:
@@ -1188,58 +1262,53 @@ def _command_option_signature(options: list[dict[str, Any]] | None) -> tuple:
     for option in options or []:
         result.append((
             str(option.get("name", "")),
-            int(option.get("type", 0)),
+            _enum_int(option.get("type", 0)),
             bool(option.get("required", False)),
             _command_option_signature(option.get("options")),
         ))
     return tuple(result)
 
 
-def _local_command_signature(command: Any) -> tuple:
-    data = command.to_dict()
+def _local_command_signature(command: Any, tree: Any) -> tuple:
+    data = command.to_dict(tree)
     return (str(command.qualified_name), int(data.get("type", 0)), _command_option_signature(data.get("options")))
+
+
+def _remote_option_signature(options: list[dict[str, Any]] | None) -> tuple:
+    return tuple(
+        (
+            str(option.get("name", "")),
+            _enum_int(option.get("type", 0)),
+            bool(option.get("required", False)),
+            _remote_option_signature(option.get("options")),
+        )
+        for option in (options or [])
+    )
 
 
 def _remote_command_signatures(commands: list[Any]) -> dict[str, tuple]:
     result: dict[str, tuple] = {}
 
-    def walk(options: list[Any], prefix: str, parent_type: int) -> None:
+    def walk_options(options: list[dict[str, Any]] | None, prefix: str) -> None:
         for option in options or []:
-            option_type = int(getattr(option, "type", 0) or 0)
-            option_name = str(getattr(option, "name", ""))
+            option_type = _enum_int(option.get("type", 0))
+            option_name = str(option.get("name", ""))
             qualified = f"{prefix} {option_name}".strip()
-            nested = getattr(option, "options", None) or []
-            if option_type in {1, 2} and nested:
-                if option_type == 2:
-                    walk(nested, qualified, option_type)
-                else:
-                    parameters = []
-                    for parameter in nested:
-                        parameters.append((
-                            str(getattr(parameter, "name", "")),
-                            int(getattr(parameter, "type", 0) or 0),
-                            bool(getattr(parameter, "required", False)),
-                            (),
-                        ))
-                    result[qualified] = ("1", option_name, tuple(parameters))
+            nested = option.get("options") or []
+            if option_type == 2:
+                walk_options(nested, qualified)
             elif option_type == 1:
-                result[qualified] = ("1", option_name, ())
+                result[qualified] = ("1", option_name, _remote_option_signature(nested))
 
     for command in commands:
-        top_name = str(getattr(command, "name", ""))
-        top_type = int(getattr(command, "type", 0) or 0)
-        if top_type == 1:
-            options = []
-            for option in getattr(command, "options", []) or []:
-                options.append((
-                    str(getattr(option, "name", "")),
-                    int(getattr(option, "type", 0) or 0),
-                    bool(getattr(option, "required", False)),
-                    (),
-                ))
-            result[top_name] = ("1", top_name, tuple(options))
-        elif top_type == 2:
-            walk(getattr(command, "options", []) or [], top_name, top_type)
+        data = command.to_dict()
+        top_name = str(data.get("name", ""))
+        top_type = _enum_int(data.get("type", 0))
+        options = data.get("options") or []
+        if top_type == 2:
+            walk_options(options, top_name)
+        elif top_type == 1:
+            result[top_name] = ("1", top_name, _remote_option_signature(options))
         else:
             result[top_name] = (str(top_type), top_name, ())
     return result
@@ -1248,26 +1317,43 @@ def _remote_command_signatures(commands: list[Any]) -> dict[str, tuple]:
 async def _remote_command_sync_check(bot: Any, guild_id: int) -> DiagnosticResult:
     try:
         import discord
-        remote = await bot.tree.fetch_commands(guild=discord.Object(id=guild_id))
-        local = {command.qualified_name: _local_command_signature(command) for command in bot.tree.walk_commands() if not hasattr(command, "commands")}
-        remote_signatures = _remote_command_signatures(remote)
-        missing = sorted(set(local) - set(remote_signatures))
+        guild_object = discord.Object(id=guild_id)
+        guild_remote = await bot.tree.fetch_commands(guild=guild_object)
+        global_remote = await bot.tree.fetch_commands()
+        local = {command.qualified_name: _local_command_signature(command, bot.tree) for command in bot.tree.walk_commands() if not getattr(command, "commands", None)}
+        settings = get_settings()
+        primary = global_remote if settings.app_env == "production" else guild_remote
+        secondary = guild_remote if settings.app_env == "production" else global_remote
+        primary_signatures = _remote_command_signatures(primary)
+        duplicate_primary = sorted({str(getattr(command, "name", "")) for command in primary if sum(1 for candidate in primary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
+        duplicate_secondary = sorted({str(getattr(command, "name", "")) for command in secondary if sum(1 for candidate in secondary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
+        missing = sorted(set(local) - set(primary_signatures))
         stale = []
-        for name in sorted(set(local) & set(remote_signatures)):
+        for name in sorted(set(local) & set(primary_signatures)):
             local_data = local[name]
-            remote_data = remote_signatures[name]
+            remote_data = primary_signatures[name]
             local_options = local_data[2]
             remote_options = remote_data[2] if len(remote_data) > 2 else ()
             if local_options != remote_options:
                 stale.append(name)
-        if missing or stale:
+        scope_issues = []
+        if duplicate_primary:
+            scope_issues.append(f"duplicados no escopo principal: {', '.join(duplicate_primary[:6])}")
+        if duplicate_secondary:
+            scope_issues.append(f"duplicados no escopo secundário: {', '.join(duplicate_secondary[:6])}")
+        if secondary:
+            label = "comandos de guilda antigos" if settings.app_env == "production" else "comandos globais antigos"
+            scope_issues.append(f"{label}: {len(secondary)}")
+        if missing or stale or scope_issues:
             detail = []
             if missing:
                 detail.append(f"ausentes no Discord: {', '.join(missing[:6])}")
             if stale:
                 detail.append(f"assinatura desatualizada: {', '.join(stale[:6])}")
+            detail.extend(scope_issues)
             return DiagnosticResult("Discord commands", False, " | ".join(detail))
-        return DiagnosticResult("Discord commands", True, f"{len(remote_signatures)} comandos da guild sincronizados com a árvore local")
+        expected_scope = "globais" if settings.app_env == "production" else "da guild"
+        return DiagnosticResult("Discord commands", True, f"{len(primary_signatures)} comandos executáveis {expected_scope} sincronizados com a árvore local; escopo secundário vazio")
     except Exception as exc:
         return DiagnosticResult("Discord commands", False, f"{type(exc).__name__}: {str(exc)[:220]}")
 
@@ -1275,6 +1361,8 @@ async def run_diagnostics(bot: Any, guild_id: int, user_id: int, channel_id: int
     results: list[DiagnosticResult] = [
         _python_runtime_check(),
         _command_check(bot),
+        _command_matrix_check(),
+        *_command_matrix_details(),
         _command_serialization_check(bot),
         _command_id_input_check(),
         _command_decorator_check(),
@@ -1322,6 +1410,7 @@ async def run_diagnostics(bot: Any, guild_id: int, user_id: int, channel_id: int
     results.append(await _reminder_smoke(guild_id, diagnostic_user_id))
     results.append(await _analytics_smoke(guild_id, diagnostic_user_id))
     results.append(await _community_smoke(guild_id, diagnostic_user_id))
+    results.append(_runtime_regression_check())
     results.append(_automod_smoke(guild_id, diagnostic_user_id))
     results.append(_antiraid_smoke(guild_id, diagnostic_user_id))
     results.append(_dashboard_check())

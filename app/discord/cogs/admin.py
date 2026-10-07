@@ -43,12 +43,12 @@ class AdminCog(commands.Cog):
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     async def credit(self, interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[float, 0.01, MAX_ADMIN_AMOUNT], note: str | None = None) -> None:
+        await defer(interaction)
         if not self.valid_amount(amount):
             await respond(interaction, "O valor deve estar entre 0,01 e 1.000.000.000,00.", ephemeral=True)
             return
         guild = interaction.guild
         assert guild is not None
-        await defer(interaction)
         async with session_factory() as session:
             await ensure_guild(session, guild.id, guild.name, guild.owner_id, guild.icon.url if guild.icon else None)
             await ensure_user(session, user.id, user.name, user.display_name, user.display_avatar.url, user.banner.url if user.banner else None, user.bot)
@@ -64,12 +64,12 @@ class AdminCog(commands.Cog):
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     async def debit(self, interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[float, 0.01, MAX_ADMIN_AMOUNT], note: str | None = None) -> None:
+        await defer(interaction)
         if not self.valid_amount(amount):
             await respond(interaction, "O valor deve estar entre 0,01 e 1.000.000.000,00.", ephemeral=True)
             return
         guild = interaction.guild
         assert guild is not None
-        await defer(interaction)
         async with session_factory() as session:
             await ensure_guild(session, guild.id, guild.name, guild.owner_id, guild.icon.url if guild.icon else None)
             await ensure_user(session, user.id, user.name, user.display_name, user.display_avatar.url, user.banner.url if user.banner else None, user.bot)
@@ -85,6 +85,7 @@ class AdminCog(commands.Cog):
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     async def shop_add(self, interaction: discord.Interaction, name: str, price: app_commands.Range[float, 0.01, MAX_ADMIN_AMOUNT], category: str, stock: app_commands.Range[int, 0, 1_000_000] | None = None) -> None:
+        await defer(interaction)
         name = " ".join(name.split())
         category = " ".join(category.split())
         if not name or len(name) > 100 or not category or len(category) > 50 or not self.valid_amount(price):
@@ -92,7 +93,6 @@ class AdminCog(commands.Cog):
             return
         guild = interaction.guild
         assert guild is not None
-        await defer(interaction)
         async with session_factory() as session:
             duplicate = await session.scalar(select(ShopItem.id).where(ShopItem.guild_id == guild.id, func.lower(ShopItem.name) == name.casefold()).limit(1))
             if duplicate is not None:
@@ -101,12 +101,13 @@ class AdminCog(commands.Cog):
             row = ShopItem(guild_id=guild.id, name=name, description="", category=category, rarity="common", price=Decimal(str(price)), stock=stock, stack_limit=99, metadata_json={}, created_at=utc_now(), updated_at=utc_now())
             session.add(row)
             try:
+                await session.flush()
+                item_id = row.id
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
                 await respond(interaction, "O item não pôde ser criado porque o nome já existe.", ephemeral=True)
                 return
-            item_id = row.id
         await self.audit(guild.id, interaction.user.id, "shop.create", f"item:{item_id}", None, {"name": name, "price": str(price), "category": category, "stock": stock})
         page = embed("BN / ITEM PUBLICADO", f"**{name}** entrou na loja.", "admin")
         page.add_field(name="ID", value=f"`{item_id}`", inline=True)
@@ -118,6 +119,7 @@ class AdminCog(commands.Cog):
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     async def job_add(self, interaction: discord.Interaction, key: str, name: str, salary: app_commands.Range[float, 0.01, MAX_ADMIN_AMOUNT], xp_reward: app_commands.Range[int, 1, 100000] = 25) -> None:
+        await defer(interaction)
         key = key.strip().casefold()
         name = " ".join(name.split())
         if not re.fullmatch(r"[a-z0-9_-]{2,32}", key):
@@ -128,7 +130,6 @@ class AdminCog(commands.Cog):
             return
         guild = interaction.guild
         assert guild is not None
-        await defer(interaction)
         async with session_factory() as session:
             duplicate = await session.scalar(select(Job.id).where(Job.guild_id == guild.id, Job.key == key).limit(1))
             if duplicate is not None:
@@ -137,12 +138,13 @@ class AdminCog(commands.Cog):
             row = Job(guild_id=guild.id, key=key, name=name, salary=Decimal(str(salary)), xp_reward=xp_reward, requirements={}, created_at=utc_now(), updated_at=utc_now())
             session.add(row)
             try:
+                await session.flush()
+                job_id = row.id
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
                 await respond(interaction, "O emprego não pôde ser criado porque a chave já existe.", ephemeral=True)
                 return
-            job_id = row.id
         await self.audit(guild.id, interaction.user.id, "job.create", f"job:{job_id}", None, {"key": key, "salary": str(salary), "xp_reward": xp_reward})
         page = embed("BN / EMPREGO CRIADO", f"**{name}** está disponível para os membros.", "admin")
         page.add_field(name="Chave", value=f"`{key}`", inline=True)
@@ -154,6 +156,7 @@ class AdminCog(commands.Cog):
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     async def timezone(self, interaction: discord.Interaction, timezone_name: str) -> None:
+        await defer(interaction)
         from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
         timezone_name = timezone_name.strip()
         try:
@@ -163,7 +166,6 @@ class AdminCog(commands.Cog):
             return
         guild = interaction.guild
         assert guild is not None
-        await defer(interaction)
         async with session_factory() as session:
             settings = await session.get(GuildSettings, guild.id)
             if settings is None:
@@ -180,5 +182,12 @@ class AdminCog(commands.Cog):
         await respond(interaction, embed=page)
 
 
-def add_to_tree(bot: commands.Bot) -> None:
-    bot.tree.add_command(admin_group)
+def add_to_tree(bot: commands.Bot, binding: commands.Cog | None = None) -> None:
+    if binding is not None:
+        for command in list(admin_group.commands):
+            if getattr(command, "binding", None) is binding:
+                continue
+            bound = command._copy_with(parent=admin_group, binding=binding)
+            admin_group.remove_command(command.name)
+            admin_group.add_command(bound)
+    bot.tree.add_command(admin_group, override=True)

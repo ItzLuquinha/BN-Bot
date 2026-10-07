@@ -6,21 +6,23 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import json
 import secrets
 from app.core.redis import redis_client
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.sessions import SessionMiddleware
 from app.config import get_settings
-from app.core.db import get_session
+from app.core.db import get_session, session_factory
 from app.core.security import new_state
 from app.repositories.analytics import overview
 from app.services.analytics import activity_series, top_channels
 from app.services.automod import ACTIONS, RULE_TYPES, validate_rule_config
-from app.models import AuditLog, AutoModListEntry, AutoModRule, GuildSettings, Member, EconomyAccount, Experience, Reputation, Ticket, TicketEvent, Suggestion, Report, Giveaway, GiveawayEntry, Poll, PollVote
+from app.models import AuditLog, AutoModListEntry, AutoModRule, Guild, GuildSettings, Member, EconomyAccount, Experience, Reputation, Ticket, TicketEvent, Suggestion, Report, Giveaway, GiveawayEntry, Poll, PollVote
 
 settings = get_settings()
 app = FastAPI(title="BN Bot Dashboard")
@@ -63,6 +65,10 @@ class AutoModListInput(BaseModel):
 async def discord_get(path: str, access_token: str) -> Any:
     async with httpx.AsyncClient(base_url="https://discord.com/api/v10", timeout=10) as client:
         response = await client.get(path, headers={"Authorization": f"Bearer {access_token}"})
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="Discord authentication session expired")
+    if response.status_code == 403:
+        raise HTTPException(status_code=403, detail="Discord denied access to this resource")
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail="Discord authentication service unavailable")
     return response.json()
@@ -83,8 +89,12 @@ async def get_dashboard_token(request: Request) -> str:
     if not raw:
         request.session.clear()
         raise HTTPException(status_code=401, detail="Authentication session expired")
-    data = json.loads(raw)
-    token = data.get("access_token")
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        request.session.clear()
+        raise HTTPException(status_code=401, detail="Authentication session expired")
+    token = data.get("access_token") if isinstance(data, dict) else None
     if not token:
         request.session.clear()
         raise HTTPException(status_code=401, detail="Authentication session expired")
@@ -93,7 +103,12 @@ async def get_dashboard_token(request: Request) -> str:
 async def session_guilds(request: Request) -> list[dict[str, Any]]:
     token = await get_dashboard_token(request)
     guilds = await discord_get("/users/@me/guilds", token)
-    return [g for g in guilds if int(g.get("permissions", 0)) & 32 or int(g.get("permissions", 0)) & 8 or bool(g.get("owner"))]
+    manageable = [g for g in guilds if int(g.get("permissions", 0)) & 32 or int(g.get("permissions", 0)) & 8 or bool(g.get("owner"))]
+    if not manageable:
+        return []
+    async with session_factory() as session:
+        active_ids = set((await session.execute(select(Guild.id).where(Guild.active.is_(True), Guild.id.in_([int(g["id"]) for g in manageable])))).scalars())
+    return [g for g in manageable if int(g["id"]) in active_ids]
 
 async def authorized_guild(request: Request, guild_id: int) -> dict[str, Any]:
     guilds = await session_guilds(request)
@@ -148,6 +163,7 @@ async def auth_logout(request: Request):
 
 @app.get("/api/me")
 async def api_me(request: Request):
+    await get_dashboard_token(request)
     user = request.session.get("user")
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -168,7 +184,7 @@ async def api_activity(request: Request, guild_id: int, days: int = 7, session: 
     await authorized_guild(request, guild_id)
     if days not in {1, 7, 30, 90}:
         raise HTTPException(status_code=400, detail="days must be 1, 7, 30 or 90")
-    return {"messages": await activity_series(session, guild_id, "messages", days), "channels": await top_channels(session, guild_id, "messages")}
+    return {"messages": await activity_series(session, guild_id, "messages", days), "channels": await top_channels(session, guild_id, "messages", days=days)}
 
 @app.get("/api/guilds/{guild_id}/members")
 async def api_members(request: Request, guild_id: int, page: int = 1, page_size: int = 25, session: AsyncSession = Depends(get_session)):
@@ -207,8 +223,17 @@ async def update_settings(request: Request, guild_id: int, payload: GuildSetting
     settings_row = await session.get(GuildSettings, guild_id)
     if settings_row is None:
         raise HTTPException(status_code=404, detail="Guild settings not found")
-    settings_row.timezone = payload.timezone
-    settings_row.locale = payload.locale
+    timezone_name = payload.timezone.strip()
+    locale_name = payload.locale.strip()
+    if not timezone_name or len(locale_name) < 2:
+        raise HTTPException(status_code=422, detail="Timezone and locale are required")
+    try:
+        ZoneInfo(timezone_name)
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        raise HTTPException(status_code=422, detail="Invalid timezone") from None
+    settings_row.timezone = timezone_name
+    settings_row.locale = locale_name
+    settings_row.updated_at = datetime.now(timezone.utc)
     await session.commit()
     return {"timezone": settings_row.timezone, "locale": settings_row.locale}
 
@@ -258,6 +283,7 @@ async def update_automod(request: Request, guild_id: int, payload: AutoModStatus
     config["automod"] = automod_config
     settings_row.config = config
     settings_row.automod_enabled = payload.enabled
+    settings_row.updated_at = datetime.now(timezone.utc)
     await _dashboard_audit(request, session, guild_id, "automod.settings_update", "settings", None, {"enabled": payload.enabled, "blacklist_action": payload.blacklist_action})
     await session.commit()
     return {"enabled": settings_row.automod_enabled, "blacklist_action": payload.blacklist_action}
@@ -268,6 +294,11 @@ async def create_automod_rule(request: Request, guild_id: int, payload: AutoModR
     if request.headers.get("x-csrf-token") != request.session.get("csrf"):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
     await authorized_guild(request, guild_id)
+    name = " ".join(payload.name.split())
+    if not name:
+        raise HTTPException(status_code=422, detail="Rule name cannot be empty")
+    if len(name) > 120:
+        raise HTTPException(status_code=422, detail="Rule name is too long")
     if payload.rule_type not in RULE_TYPES:
         raise HTTPException(status_code=422, detail="Invalid rule type")
     if payload.action not in ACTIONS:
@@ -275,15 +306,19 @@ async def create_automod_rule(request: Request, guild_id: int, payload: AutoModR
     errors = validate_rule_config(payload.rule_type, payload.config)
     if errors:
         raise HTTPException(status_code=422, detail="; ".join(errors))
-    existing = await session.execute(select(AutoModRule).where(AutoModRule.guild_id == guild_id, AutoModRule.name == payload.name))
+    existing = await session.execute(select(AutoModRule).where(AutoModRule.guild_id == guild_id, func.lower(AutoModRule.name) == name.casefold()))
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(status_code=409, detail="A rule with this name already exists")
     if any(value <= 0 for value in payload.channel_ids + payload.role_ids):
         raise HTTPException(status_code=422, detail="IDs must be positive")
     now = datetime.now(timezone.utc)
-    row = AutoModRule(guild_id=guild_id, name=payload.name, rule_type=payload.rule_type, action=payload.action, enabled=payload.enabled, priority=payload.priority, channel_ids=payload.channel_ids, role_ids=payload.role_ids, config=payload.config, created_at=now, updated_at=now)
+    row = AutoModRule(guild_id=guild_id, name=name, rule_type=payload.rule_type, action=payload.action, enabled=payload.enabled, priority=payload.priority, channel_ids=payload.channel_ids, role_ids=payload.role_ids, config=payload.config, created_at=now, updated_at=now)
     session.add(row)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="A rule with this name already exists") from None
     await _dashboard_audit(request, session, guild_id, "automod.rule_create", f"rule:{row.id}", None, _automod_rule_json(row))
     await session.commit()
     return _automod_rule_json(row)
@@ -352,7 +387,11 @@ async def create_automod_list(request: Request, guild_id: int, payload: AutoModL
     now = datetime.now(timezone.utc)
     row = AutoModListEntry(guild_id=guild_id, list_type=payload.list_type, entry_type=payload.entry_type, value=value, reason=payload.reason, created_at=now, updated_at=now)
     session.add(row)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="List entry already exists") from None
     await _dashboard_audit(request, session, guild_id, "automod.list_add", f"{row.list_type}:{row.entry_type}:{row.value}", None, {"reason": row.reason})
     await session.commit()
     return {"id": row.id, "list_type": row.list_type, "entry_type": row.entry_type, "value": row.value, "reason": row.reason}

@@ -108,6 +108,7 @@ class AutoModCog(commands.Cog):
             guild_id=message.guild.id,
             channel_id=message.channel.id,
             user_id=message.author.id,
+            message_id=message.id,
             role_ids=role_ids,
             content=message.content,
             mention_count=len(message.mentions) + (1 if message.mention_everyone else 0),
@@ -117,7 +118,16 @@ class AutoModCog(commands.Cog):
             member_age_seconds=max(int((now - joined_at).total_seconds()), 0) if joined_at else None,
         )
         context = await collect_activity(context)
-        rules = [_rule_definition(row) for row in rule_rows]
+        rules = []
+        valid_rule_rows = []
+        for row in rule_rows:
+            config_errors = validate_rule_config(row.rule_type, dict(row.config or {}))
+            if config_errors:
+                logger.error("invalid AutoMod rule config skipped guild=%s rule=%s errors=%s", message.guild.id, row.id, " | ".join(config_errors[:4]))
+                continue
+            rules.append(_rule_definition(row))
+            valid_rule_rows.append(row)
+        rule_rows = valid_rule_rows
         whitelist = [dict(list_type=row.list_type, entry_type=row.entry_type, value=row.value) for row in entries_rows if row.list_type == "whitelist"]
         blacklist = [dict(list_type=row.list_type, entry_type=row.entry_type, value=row.value) for row in entries_rows if row.list_type == "blacklist"]
         automod_config = dict((settings.config or {}).get("automod", {}))
@@ -128,22 +138,29 @@ class AutoModCog(commands.Cog):
             return False
         try:
             evaluation, rows = await self.evaluate(message)
-            if not evaluation or not evaluation.matched:
-                return False
-            selected = evaluation.rule
-            selected_row = next((row for row in rows if selected and row.id == selected.id), None)
-            primary = evaluation.matched[0]
-            action = evaluation.action
-            data = {"detections": [{"rule_type": item.rule_type, "severity": item.severity, "reason": item.reason, "metadata": item.metadata} for item in evaluation.matched]}
+        except Exception:
+            logger.exception("automod evaluation failed guild=%s channel=%s message=%s", message.guild.id, message.channel.id, message.id)
+            return False
+        if not evaluation or not evaluation.matched:
+            return False
+        selected = evaluation.rule
+        selected_row = next((row for row in rows if selected and row.id == selected.id), None)
+        primary = evaluation.matched[0]
+        action = evaluation.action
+        data = {"detections": [{"rule_type": item.rule_type, "severity": item.severity, "reason": item.reason, "metadata": item.metadata} for item in evaluation.matched]}
+        try:
+            await self.execute_action(message, action, primary.reason, selected_row.config if selected_row else {})
+        except Exception:
+            logger.exception("automod action failed guild=%s channel=%s message=%s action=%s", message.guild.id, message.channel.id, message.id, action)
+            return False
+        try:
             async with session_factory() as session:
                 event_id = secrets.randbits(62)
                 session.add(AutoModEvent(id=event_id, guild_id=message.guild.id, channel_id=message.channel.id, user_id=message.author.id, message_id=message.id, rule_id=selected_row.id if selected_row else None, rule_type=primary.rule_type, action=action, reason=primary.reason, data=data, created_at=utc_now()))
                 await session.commit()
-            await self.execute_action(message, action, primary.reason, selected_row.config if selected_row else {})
-            return action != "none"
         except Exception:
-            logger.exception("automod evaluation failed guild=%s channel=%s message=%s", message.guild.id if message.guild else None, message.channel.id, message.id)
-            return False
+            logger.exception("automod event persistence failed guild=%s channel=%s message=%s action=%s", message.guild.id, message.channel.id, message.id, action)
+        return action != "none"
 
     async def execute_action(self, message: discord.Message, action: str, reason: str, config: dict[str, Any]) -> None:
         if action == "none":
@@ -162,24 +179,29 @@ class AutoModCog(commands.Cog):
         if action == "timeout":
             duration = max(min(int(config.get("timeout_seconds", 600)), 2_419_200), 1)
             member = message.author if isinstance(message.author, discord.Member) else None
-            if member:
-                await member.timeout(timedelta(seconds=duration), reason=f"BN Bot AutoMod: {reason}")
+            if member is None:
+                raise ValidationFailure("Não foi possível aplicar timeout neste autor.")
+            await member.timeout(timedelta(seconds=duration), reason=f"BN Bot AutoMod: {reason}")
             try:
                 await message.delete(reason=f"BN Bot AutoMod: {reason}")
             except discord.HTTPException:
                 pass
             async with session_factory() as session:
-                await record_punishment(session, message.guild.id, message.author.id, self.bot.user.id if self.bot.user else 0, "timeout", f"AutoMod: {reason}", utc_now() + timedelta(seconds=duration), {"duration_seconds": duration, "source": "automod"})
+                await record_punishment(session, message.guild.id, member.id, self.bot.user.id if self.bot.user else 0, "timeout", f"AutoMod: {reason}", utc_now() + timedelta(seconds=duration), {"duration_seconds": duration, "source": "automod"})
             return
         if action == "kick":
             member = message.author if isinstance(message.author, discord.Member) else None
             if member:
                 await member.kick(reason=f"BN Bot AutoMod: {reason}")
+                async with session_factory() as session:
+                    await record_punishment(session, message.guild.id, member.id, self.bot.user.id if self.bot.user else 0, "kick", f"AutoMod: {reason}", None, {"source": "automod"})
             return
         if action == "ban":
             member = message.author if isinstance(message.author, discord.Member) else None
             if member:
                 await member.ban(reason=f"BN Bot AutoMod: {reason}", delete_message_seconds=0)
+                async with session_factory() as session:
+                    await record_punishment(session, message.guild.id, member.id, self.bot.user.id if self.bot.user else 0, "ban", f"AutoMod: {reason}", None, {"source": "automod"})
 
     @automod_group.command(name="enable", description="Ativa o AutoMod no servidor.")
     @app_commands.guild_only()
@@ -297,12 +319,13 @@ class AutoModCog(commands.Cog):
             row = AutoModRule(guild_id=interaction.guild.id, name=name, rule_type=rule_type, action=action, enabled=True, priority=priority, channel_ids=channel_ids, role_ids=role_ids, config=config, created_at=utc_now(), updated_at=utc_now())
             session.add(row)
             try:
+                await session.flush()
+                rule_id = row.id
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
                 await respond(interaction, "A regra não pôde ser criada porque já existe uma regra com esse nome.", ephemeral=True)
                 return
-            rule_id = row.id
         await self.audit(interaction.guild.id, interaction.user.id, "automod.rule_create", f"rule:{rule_id}", None, {"name": name, "rule_type": rule_type, "action": action, "priority": priority, "channels": channel_ids, "roles": role_ids, "config": config})
         page = embed("BN / REGRA CRIADA", f"**{name}** entrou no conjunto de proteção.", "security")
         page.add_field(name="ID", value=f"`{rule_id}`", inline=True)
@@ -529,5 +552,12 @@ class AutoModCog(commands.Cog):
         await respond(interaction, embed=page, ephemeral=True)
 
 
-def add_to_tree(bot: commands.Bot) -> None:
-    bot.tree.add_command(automod_group)
+def add_to_tree(bot: commands.Bot, binding: commands.Cog | None = None) -> None:
+    if binding is not None:
+        for command in list(automod_group.commands):
+            if getattr(command, "binding", None) is binding:
+                continue
+            bound = command._copy_with(parent=automod_group, binding=binding)
+            automod_group.remove_command(command.name)
+            automod_group.add_command(bound)
+    bot.tree.add_command(automod_group, override=True)

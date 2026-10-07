@@ -12,7 +12,7 @@ from app.core.interactions import defer, respond
 from app.core.time import utc_now
 from app.core.validation import parse_snowflake
 from app.models import AuditLog, GuildSettings, RaidEvent, RaidProtection, RaidLockdownChannel
-from app.services.antiraid import RESPONSE_ACTIONS, JoinContext, clear_expired_state, evaluate_join, load_protection
+from app.services.antiraid import RESPONSE_ACTIONS, JoinContext, clamp_quarantine_timeout_seconds, clear_expired_state, evaluate_join, load_protection, merge_lockdown_guild_ids
 from app.discord.theme import embed, number, bar, status_line
 
 logger = logging.getLogger("bn_bot.antiraid")
@@ -144,10 +144,10 @@ class AntiRaidCog(commands.Cog):
             async with session_factory() as session:
                 protection = await session.get(RaidProtection, member.guild.id)
                 role_id = protection.quarantine_role_id if protection else None
-                quarantine_timeout = int((protection.config or {}).get("quarantine_timeout_seconds", 900)) if protection else 900
+                quarantine_timeout = clamp_quarantine_timeout_seconds((protection.config or {}).get("quarantine_timeout_seconds", 900) if protection else 900)
             applied = await self.quarantine(member, role_id)
             try:
-                await member.timeout(timedelta(seconds=min(max(quarantine_timeout, 60), 2_419_200)), reason=f"BN Bot Anti-Raid: {', '.join(decision.reasons)}")
+                await member.timeout(timedelta(seconds=quarantine_timeout), reason=f"BN Bot Anti-Raid: {', '.join(decision.reasons)}")
                 applied = True
             except discord.HTTPException:
                 logger.exception("antiraid quarantine timeout failed guild=%s user=%s", member.guild.id, member.id)
@@ -216,10 +216,17 @@ class AntiRaidCog(commands.Cog):
         async with session_factory() as session:
             row = await load_protection(session, interaction.guild.id)
             row.enabled = False
+            row.active_until = None
             row.updated_at = utc_now()
             await session.commit()
         restored = await self.remove_lockdown(interaction.guild)
         pending = await self.lockdown_pending_count(interaction.guild.id)
+        if pending:
+            async with session_factory() as session:
+                row = await load_protection(session, interaction.guild.id)
+                row.active_until = utc_now()
+                row.updated_at = utc_now()
+                await session.commit()
         await self.audit(interaction.guild.id, interaction.user.id, "antiraid.disable", "settings", None, {"enabled": False, "restored_channels": restored, "pending_channels": pending})
         page = embed("BN / ANTI-RAID", "A proteção foi desativada e o lockdown foi revisado.", "security")
         page.add_field(name="Canais restaurados", value=f"`{number(len(restored))}`", inline=True)
@@ -341,7 +348,8 @@ class AntiRaidCog(commands.Cog):
     async def expire_lockdowns(self) -> None:
         async with session_factory() as session:
             guild_ids = await clear_expired_state(session)
-        for guild_id in guild_ids:
+            pending_ids = list((await session.execute(select(RaidLockdownChannel.guild_id).distinct())).scalars())
+        for guild_id in merge_lockdown_guild_ids(guild_ids, pending_ids):
             guild = self.bot.get_guild(guild_id)
             if guild is not None:
                 try:
@@ -350,5 +358,12 @@ class AntiRaidCog(commands.Cog):
                     logger.exception("antiraid lockdown expiration failed guild=%s", guild_id)
 
 
-def add_to_tree(bot: commands.Bot) -> None:
-    bot.tree.add_command(raid_group)
+def add_to_tree(bot: commands.Bot, binding: commands.Cog | None = None) -> None:
+    if binding is not None:
+        for command in list(raid_group.commands):
+            if getattr(command, "binding", None) is binding:
+                continue
+            bound = command._copy_with(parent=raid_group, binding=binding)
+            raid_group.remove_command(command.name)
+            raid_group.add_command(bound)
+    bot.tree.add_command(raid_group, override=True)

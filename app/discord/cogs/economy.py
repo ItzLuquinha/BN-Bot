@@ -5,17 +5,18 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from app.core.db import session_factory
 from app.core.interactions import defer, respond
 from app.models import ShopItem, InventoryItem, UserJob, Job, Experience
 from app.repositories.economy import get_shop_items, buy_item, sell_item
 from app.repositories.guilds import ensure_guild, ensure_user, ensure_member
 from app.services.economy import economy_service
-from app.services.cooldowns import check_and_set
+from app.services.cooldowns import check_and_set, release
 from app.core.time import utc_now
 from app.services.rewards import claim_reward
 from app.core.exceptions import CooldownActive
-from app.discord.theme import embed, money, number, bar, percent, ledger, compact_money, status_line
+from app.discord.theme import embed, money, number, bar, percent, ledger, compact_money, status_line, duration
 
 
 MAX_TRANSACTION = 1_000_000_000.0
@@ -145,7 +146,7 @@ class EconomyCog(commands.Cog):
                 amount, streak = await claim_reward(session, guild.id, member.id, "daily", Decimal("250"))
                 await session.commit()
         except CooldownActive as exc:
-            await respond(interaction, f"A recompensa diária já foi coletada. Próxima janela em {exc.seconds // 3600}h.", ephemeral=True)
+            await respond(interaction, f"A recompensa diária já foi coletada. Próxima janela em {duration(exc.seconds)}.", ephemeral=True)
             return
         page = embed("BN / DAILY", "Recompensa diária confirmada.", "economy")
         page.add_field(name="Recebido", value=money(amount), inline=True)
@@ -166,7 +167,7 @@ class EconomyCog(commands.Cog):
                 amount, streak = await claim_reward(session, guild.id, member.id, "weekly", Decimal("1500"))
                 await session.commit()
         except CooldownActive as exc:
-            await respond(interaction, f"A recompensa semanal já foi coletada. Próxima janela em {exc.seconds // 86400}d.", ephemeral=True)
+            await respond(interaction, f"A recompensa semanal já foi coletada. Próxima janela em {duration(exc.seconds)}.", ephemeral=True)
             return
         page = embed("BN / WEEKLY", "Recompensa semanal confirmada.", "economy")
         page.add_field(name="Recebido", value=money(amount), inline=True)
@@ -279,19 +280,26 @@ class EconomyCog(commands.Cog):
             if job is None:
                 await respond(interaction, "Emprego não encontrado.", ephemeral=True)
                 return
-            required_level = int(job.requirements.get("level", 0)) if isinstance(job.requirements, dict) else 0
+            try:
+                required_level = max(int(job.requirements.get("level", 0)), 0) if isinstance(job.requirements, dict) else 0
+            except (TypeError, ValueError):
+                required_level = 0
             xp = (await session.execute(select(Experience).where(Experience.guild_id == guild.id, Experience.user_id == member.id))).scalar_one_or_none()
             if (xp.level if xp else 0) < required_level:
                 await respond(interaction, f"Este emprego exige nível {required_level}.", ephemeral=True)
                 return
             user_job = (await session.execute(select(UserJob).where(UserJob.guild_id == guild.id, UserJob.user_id == member.id).with_for_update())).scalar_one_or_none()
             if user_job is None:
-                user_job = UserJob(guild_id=guild.id, user_id=member.id, job_id=job.id, level=1, xp=0)
-                session.add(user_job)
+                try:
+                    async with session.begin_nested():
+                        user_job = UserJob(guild_id=guild.id, user_id=member.id, job_id=job.id, level=1, xp=0)
+                        session.add(user_job)
+                        await session.flush()
+                except IntegrityError:
+                    user_job = (await session.execute(select(UserJob).where(UserJob.guild_id == guild.id, UserJob.user_id == member.id).with_for_update())).scalar_one()
+                    user_job.job_id = job.id
             else:
                 user_job.job_id = job.id
-                user_job.level = 1
-                user_job.xp = 0
             await session.commit()
         page = embed("BN / EMPREGO EQUIPADO", f"**{job.name}** está agora equipado.", "economy")
         page.add_field(name="Chave", value=f"`{job.key}`", inline=True)
@@ -304,30 +312,37 @@ class EconomyCog(commands.Cog):
     async def work(self, interaction: discord.Interaction) -> None:
         guild, member = self.guild_and_member(interaction)
         await defer(interaction)
-        async with session_factory() as session:
-            await self.ensure_context(session, guild, member)
-            result = await session.execute(select(UserJob, Job).join(Job, UserJob.job_id == Job.id).where(UserJob.guild_id == guild.id, UserJob.user_id == member.id))
-            row = result.one_or_none()
-            if row is None:
-                await respond(interaction, "Você ainda não possui um emprego configurado.", ephemeral=True)
-                return
-            user_job, job = row
-            cooldown = await check_and_set(f"bn:work:{guild.id}:{member.id}", 3600)
-            if cooldown:
-                await respond(interaction, f"Você já trabalhou recentemente. Aguarde {cooldown}s.", ephemeral=True)
-                return
-            reward = job.salary * (Decimal("1") + Decimal(max(user_job.level - 1, 0)) * Decimal("0.05"))
-            user_job.xp += job.xp_reward
-            threshold = max(user_job.level, 1) * 100
-            while user_job.xp >= threshold:
-                user_job.xp -= threshold
-                user_job.level += 1
+        cooldown_key = f"bn:work:{guild.id}:{member.id}"
+        cooldown = None
+        try:
+            async with session_factory() as session:
+                await self.ensure_context(session, guild, member)
+                result = await session.execute(select(UserJob, Job).join(Job, UserJob.job_id == Job.id).where(UserJob.guild_id == guild.id, UserJob.user_id == member.id))
+                row = result.one_or_none()
+                if row is None:
+                    await respond(interaction, "Você ainda não possui um emprego configurado.", ephemeral=True)
+                    return
+                user_job, job = row
+                cooldown = await check_and_set(cooldown_key, 3600)
+                if cooldown:
+                    await respond(interaction, f"Você já trabalhou recentemente. Aguarde {cooldown}s.", ephemeral=True)
+                    return
+                reward = job.salary * (Decimal("1") + Decimal(max(user_job.level - 1, 0)) * Decimal("0.05"))
+                user_job.xp += job.xp_reward
                 threshold = max(user_job.level, 1) * 100
-            user_job.last_work_at = utc_now()
-            await economy_service.credit(session, guild.id, member.id, reward, "work", job.name)
-            next_xp = max(user_job.level, 1) * 100
-            current_xp = user_job.xp
-            job_level = user_job.level
+                while user_job.xp >= threshold:
+                    user_job.xp -= threshold
+                    user_job.level += 1
+                    threshold = max(user_job.level, 1) * 100
+                user_job.last_work_at = utc_now()
+                await economy_service.credit(session, guild.id, member.id, reward, "work", job.name)
+                next_xp = max(user_job.level, 1) * 100
+                current_xp = user_job.xp
+                job_level = user_job.level
+        except Exception:
+            if cooldown is None:
+                await release(cooldown_key)
+            raise
         page = embed("BN / TURNO CONCLUÍDO", f"**{job.name}** · trabalho registrado.", "economy")
         page.add_field(name="Recebido", value=money(reward), inline=True)
         page.add_field(name="Nível do emprego", value=f"`{job_level}`", inline=True)

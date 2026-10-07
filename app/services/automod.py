@@ -8,6 +8,8 @@ from typing import Any, Iterable
 from collections import defaultdict, deque
 import asyncio
 import logging
+import math
+import secrets
 
 logger = logging.getLogger("bn_bot.automod")
 
@@ -57,6 +59,7 @@ class MessageContext:
     guild_id: int
     channel_id: int
     user_id: int
+    message_id: int | None = None
     role_ids: set[int] = field(default_factory=set)
     content: str = ""
     mention_count: int = 0
@@ -113,12 +116,27 @@ def extract_urls(value: str) -> list[str]:
     return findall(URL_PATTERN, value)
 
 
+def normalize_domain(value: str) -> str:
+    domain = str(value).strip().casefold().strip(".")
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def domain_matches(domain: str, configured: str) -> bool:
+    normalized_domain = normalize_domain(domain)
+    normalized_configured = normalize_domain(configured)
+    return bool(normalized_domain and normalized_configured and (normalized_domain == normalized_configured or normalized_domain.endswith("." + normalized_configured)))
+
+
 def extract_domains(value: str) -> set[str]:
     domains: set[str] = set()
     for url in extract_urls(value):
         match = search(DOMAIN_PATTERN, url.casefold())
         if match:
-            domains.add(match.group(1).strip("."))
+            normalized = normalize_domain(match.group(1))
+            if normalized:
+                domains.add(normalized)
     return domains
 
 
@@ -130,17 +148,22 @@ def is_whitelisted(context: MessageContext, entries: Iterable[dict[str, Any]], c
             return True
         if kind == "channel" and value == str(context.channel_id):
             return True
-        if kind == "role" and value and int(value) in context.role_ids:
-            return True
+        if kind == "role" and value:
+            try:
+                if int(value) in context.role_ids:
+                    return True
+            except (TypeError, ValueError):
+                continue
     return False
 
 
 def whitelisted_domains(entries: Iterable[dict[str, Any]]) -> set[str]:
-    return {str(entry.get("value", "")).casefold().strip(".") for entry in entries if str(entry.get("entry_type", "")) == "domain" and str(entry.get("value", "")).strip()}
+    return {normalize_domain(entry.get("value", "")) for entry in entries if str(entry.get("entry_type", "")) == "domain" and normalize_domain(entry.get("value", ""))}
 
 
-def is_blacklisted(context: MessageContext, entries: Iterable[dict[str, Any]], content_domains: set[str]) -> list[dict[str, Any]]:
+def is_blacklisted(context: MessageContext, entries: Iterable[dict[str, Any]], content_domains: set[str], whitelisted_words: set[str] | None = None) -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
+    whitelisted_words = whitelisted_words or set()
     for entry in entries:
         kind = str(entry.get("entry_type", ""))
         value = str(entry.get("value", ""))
@@ -148,11 +171,15 @@ def is_blacklisted(context: MessageContext, entries: Iterable[dict[str, Any]], c
             matches.append(entry)
         elif kind == "channel" and value == str(context.channel_id):
             matches.append(entry)
-        elif kind == "role" and value and int(value) in context.role_ids:
+        elif kind == "role" and value:
+            try:
+                if int(value) in context.role_ids:
+                    matches.append(entry)
+            except (TypeError, ValueError):
+                continue
+        elif kind == "domain" and any(domain_matches(domain, value) for domain in content_domains):
             matches.append(entry)
-        elif kind == "domain" and value.casefold() in content_domains:
-            matches.append(entry)
-        elif kind == "word" and value.casefold() and value.casefold() in context.content.casefold():
+        elif kind == "word" and value.casefold() and value.casefold() not in whitelisted_words and value.casefold() in context.content.casefold():
             matches.append(entry)
     return matches
 
@@ -175,23 +202,42 @@ def validate_rule_config(rule_type: str, config: dict[str, Any]) -> list[str]:
             value = config[key]
             if not isinstance(value, int) or isinstance(value, bool) or value < minimum or value > maximum:
                 errors.append(f"{key} deve ser inteiro entre {minimum} e {maximum}")
-    float_rules = {"ratio": (0.0, 1.0), "threshold": (0.0, 1.0), "max_total_size_mb": (0.0, 2048.0)}
+    float_rules = {"ratio": (0.0, 1.0), "max_total_size_mb": (0.0, 2048.0)}
+    for key, (minimum, maximum) in float_rules.items():
+        if key in config:
+            value = config[key]
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or value < minimum or value > maximum:
+                errors.append(f"{key} deve ser um número finito entre {minimum} e {maximum}")
     if rule_type == "suspicious" and "threshold" in config:
         value = config["threshold"]
         if not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > 100:
             errors.append("threshold de comportamento suspeito deve ser inteiro entre 1 e 100")
     if rule_type == "similarity" and "threshold" in config:
         value = config["threshold"]
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0.5 or value > 1.0:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or value < 0.5 or value > 1.0:
             errors.append("threshold de similaridade deve estar entre 0.5 e 1.0")
+    if rule_type == "similarity" and "min_length" in config:
+        value = config["min_length"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > 10_000:
+            errors.append("min_length deve ser inteiro entre 1 e 10000")
     if rule_type == "caps" and "ratio" in config:
         value = config["ratio"]
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0.5 or value > 1.0:
             errors.append("ratio deve estar entre 0.5 e 1.0")
     if rule_type == "attachments" and "max_total_size_mb" in config:
         value = config["max_total_size_mb"]
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0 or value > 2048:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)) or value < 0 or value > 2048:
             errors.append("max_total_size_mb deve estar entre 0 e 2048")
+    if rule_type == "suspicious":
+        for key in ("new_account_weight", "new_member_weight", "invite_weight", "link_weight", "mention_weight", "activity_weight"):
+            if key in config:
+                value = config[key]
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > 100:
+                    errors.append(f"{key} deve ser inteiro entre 0 e 100")
+        if "mention_trigger" in config:
+            value = config["mention_trigger"]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > 100:
+                errors.append("mention_trigger deve ser inteiro entre 1 e 100")
     if rule_type in {"forbidden_word", "attachments"}:
         list_key = "words" if rule_type == "forbidden_word" else None
         if list_key and list_key in config and not isinstance(config[list_key], list):
@@ -221,7 +267,7 @@ def _caps_ratio(content: str) -> tuple[int, int, float]:
     return uppercase, total, uppercase / total if total else 0.0
 
 
-def detect_rule(rule: RuleDefinition, context: MessageContext, now: datetime | None = None, domain_whitelist: set[str] | None = None) -> AutoModDecision | None:
+def detect_rule(rule: RuleDefinition, context: MessageContext, now: datetime | None = None, domain_whitelist: set[str] | None = None, whitelisted_words: set[str] | None = None) -> AutoModDecision | None:
     if not rule.enabled or rule.rule_type not in RULE_TYPES or rule.action not in ACTIONS:
         return None
     if not scope_matches(rule, context):
@@ -259,22 +305,25 @@ def detect_rule(rule: RuleDefinition, context: MessageContext, now: datetime | N
                 if ratio >= threshold:
                     return AutoModDecision("similarity", 60, f"mensagem com similaridade de {ratio:.2f}", {"ratio": round(ratio, 4), "threshold": threshold})
     elif rule.rule_type == "link":
-        blocked_domains = {str(item).casefold() for item in config.get("blocked_domains", [])}
-        allowed_domains = {str(item).casefold().strip(".") for item in config.get("allowed_domains", [])}
-        allowed_domains.update(domain_whitelist or set())
-        detected = domains & blocked_domains
+        blocked_domains = {normalize_domain(item) for item in config.get("blocked_domains", []) if normalize_domain(item)}
+        allowed_domains = {normalize_domain(item) for item in config.get("allowed_domains", []) if normalize_domain(item)}
+        allowed_domains.update(normalize_domain(item) for item in (domain_whitelist or set()) if normalize_domain(item))
+        allowed = {domain for domain in domains if any(domain_matches(domain, configured) for configured in allowed_domains)}
+        detected = sorted(domain for domain in domains if any(domain_matches(domain, blocked) for blocked in blocked_domains) and domain not in allowed)
         block_all = bool(config.get("block_all", True))
-        outside_allowlist = bool(allowed_domains and domains and not domains.issubset(allowed_domains))
-        if detected or outside_allowlist or (block_all and domains):
-            return AutoModDecision("link", 75, "link não permitido", {"domains": sorted(detected or domains)})
+        blocked_by_default = bool(domains and block_all and not allowed_domains)
+        outside_allowlist = bool(allowed_domains) and any(domain not in allowed for domain in domains)
+        if detected or outside_allowlist or blocked_by_default:
+            return AutoModDecision("link", 75, "link não permitido", {"domains": detected or sorted(domain for domain in domains if domain not in allowed)})
     elif rule.rule_type == "invite":
-        if search(INVITE_PATTERN, content, flags=0) and not (domains & (domain_whitelist or set())):
+        allowed_domains = {normalize_domain(item) for item in (domain_whitelist or set()) if normalize_domain(item)}
+        if search(INVITE_PATTERN, content, flags=0) and not any(domain_matches(domain, allowed) for domain in domains for allowed in allowed_domains):
             return AutoModDecision("invite", 80, "convite do Discord detectado", {})
     elif rule.rule_type == "forbidden_word":
         lowered = content.casefold()
         for word in config.get("words", []):
             value = str(word).casefold().strip()
-            if value and value in lowered:
+            if value and value not in whitelisted_words and value in lowered:
                 return AutoModDecision("forbidden_word", 85, "palavra proibida detectada", {"word": value})
     elif rule.rule_type == "caps":
         minimum = max(int(config.get("min_letters", 20)), 1)
@@ -343,13 +392,15 @@ def evaluate_rules(
     domains = extract_domains(context.content)
     if is_whitelisted(context, whitelist_entries, domains):
         return AutoModEvaluation([], "none", None)
-    blacklisted = is_blacklisted(context, blacklist_entries, domains)
+    whitelist_list = list(whitelist_entries)
+    whitelisted_words = {str(entry.get("value", "")).casefold().strip() for entry in whitelist_list if str(entry.get("entry_type", "")) == "word" and str(entry.get("value", "")).strip()}
+    blacklisted = is_blacklisted(context, blacklist_entries, domains, whitelisted_words)
     decisions: list[AutoModDecision] = []
-    domain_allowlist = whitelisted_domains(whitelist_entries)
+    domain_allowlist = whitelisted_domains(whitelist_list)
     if blacklisted:
         decisions.append(AutoModDecision("blacklist", 100, "entrada de blacklist correspondente", {"entries": blacklisted, "priority": 1000000}))
     for rule in rules_list:
-        decision = detect_rule(rule, context, now, domain_allowlist)
+        decision = detect_rule(rule, context, now, domain_allowlist, whitelisted_words)
         if decision:
             decision.metadata["priority"] = rule.priority
             decision.metadata["rule_id"] = rule.id
@@ -375,17 +426,20 @@ class RedisActivityStore:
 
     async def add_message(self, context: MessageContext, now: datetime) -> tuple[list[datetime], list[str]]:
         timestamps_key = self.key(context.guild_id, context.user_id, "timestamps")
-        contents_key = self.key(context.guild_id, context.user_id, "contents")
+        contents_key = self.key(context.guild_id, context.user_id, "contents:v2")
         score = now.timestamp()
-        member = f"{score:.6f}:{sha256(context.content.encode('utf-8')).hexdigest()[:24]}"
+        token = str(context.message_id) if context.message_id is not None else secrets.token_hex(12)
+        member = f"{score:.6f}:{token}"
         await self.redis.zadd(timestamps_key, {member: score})
         cutoff = (now - timedelta(seconds=120)).timestamp()
         await self.redis.zremrangebyscore(timestamps_key, 0, cutoff)
         values = await self.redis.zrange(timestamps_key, 0, -1, withscores=True)
-        timestamps = [datetime.fromtimestamp(float(item[1]), timezone.utc) for item in values]
-        await self.redis.lpush(contents_key, context.content[:2000])
+        timestamps = [datetime.fromtimestamp(float(item[1]), timezone.utc) for item in values if str(item[0]) != member]
+        content_entry = f"{token}\t{context.content[:2000]}"
+        await self.redis.lpush(contents_key, content_entry)
         await self.redis.ltrim(contents_key, 0, 24)
-        recent_contents = [str(item) for item in await self.redis.lrange(contents_key, 0, 24)]
+        raw_contents = [str(item) for item in await self.redis.lrange(contents_key, 0, 24)]
+        recent_contents = [item.split("\t", 1)[1] for item in raw_contents if "\t" in item and item.split("\t", 1)[0] != token]
         return timestamps, recent_contents
 
 
@@ -400,8 +454,8 @@ async def collect_activity(context: MessageContext) -> MessageContext:
         from app.core.redis import redis_client
         store = RedisActivityStore(redis_client)
         timestamps, recent_contents = await store.add_message(context, now)
-        context.recent_message_timestamps = timestamps[:-1]
-        context.recent_contents = recent_contents[1:]
+        context.recent_message_timestamps = timestamps
+        context.recent_contents = recent_contents
         return context
     except Exception:
         key = (context.guild_id, context.user_id)

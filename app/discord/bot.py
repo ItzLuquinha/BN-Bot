@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import discord
 from sqlalchemy import select
@@ -25,6 +26,7 @@ class BNBot(commands.Bot):
         intents.voice_states = True
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.tree.on_error = self.on_app_command_error
+        self._command_sync_lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
         from app.discord.cogs.utility import UtilityCog
@@ -35,6 +37,7 @@ class BNBot(commands.Bot):
         from app.discord.cogs.automod import AutoModCog, add_to_tree as add_automod_to_tree
         from app.discord.cogs.admin import AdminCog, add_to_tree
         from app.discord.cogs.antiraid import AntiRaidCog, add_to_tree as add_antiraid_to_tree
+        from app.discord.cogs.dashboard import DashboardCog
         from app.tasks.worker import Worker
 
         await self.add_cog(UtilityCog(self))
@@ -42,37 +45,114 @@ class BNBot(commands.Bot):
         await self.add_cog(ProgressionCog(self))
         await self.add_cog(ModerationCog(self))
         await self.add_cog(CommunityCog(self))
-        await self.add_cog(AutoModCog(self))
-        await self.add_cog(AdminCog(self))
-        await self.add_cog(AntiRaidCog(self))
-        add_to_tree(self)
-        add_automod_to_tree(self)
-        add_antiraid_to_tree(self)
+        automod_cog = AutoModCog(self)
+        admin_cog = AdminCog(self)
+        antiraid_cog = AntiRaidCog(self)
+        await self.add_cog(admin_cog)
+        await self.add_cog(antiraid_cog)
+        await self.add_cog(DashboardCog(self))
+        add_to_tree(self, admin_cog)
+        add_automod_to_tree(self, automod_cog)
+        add_antiraid_to_tree(self, antiraid_cog)
         self.worker = Worker(self)
-        synced = await self.tree.sync()
-        logger.info("slash commands synchronized count=%s environment=%s", len(synced), get_settings().app_env)
-        settings = get_settings()
-        if settings.app_env != "production" and settings.discord_guild_id:
-            guild_object = discord.Object(id=settings.discord_guild_id)
+
+    async def _clear_global_commands(self) -> None:
+        global_commands = list(self.tree.get_commands())
+        self.tree.clear_commands(guild=None)
+        try:
+            await self.tree.sync()
+            logger.info("stale global slash commands removed count=%s", len(global_commands))
+        finally:
+            for command in global_commands:
+                self.tree.add_command(command)
+
+    async def _sync_guild_commands(self, guild_id: int) -> list[discord.app_commands.AppCommand]:
+        from app.services.diagnostics import _local_command_signature, _remote_command_signatures
+
+        guild_object = discord.Object(id=guild_id)
+        self.tree.clear_commands(guild=guild_object)
+        self.tree.copy_global_to(guild=guild_object)
+        synced = await self.tree.sync(guild=guild_object)
+        remote = await self.tree.fetch_commands(guild=guild_object)
+        local = {
+            command.qualified_name: _local_command_signature(command, self.tree)
+            for command in self.tree.walk_commands()
+            if not getattr(command, "commands", None)
+        }
+        remote_signatures = _remote_command_signatures(remote)
+        mismatch = sorted(set(local) - set(remote_signatures))
+        stale = sorted(
+            name for name in set(local) & set(remote_signatures)
+            if local[name][2] != remote_signatures[name][2]
+        )
+        if mismatch or stale:
+            logger.warning(
+                "guild slash command verification mismatch guild=%s missing=%s stale=%s retrying",
+                guild_id,
+                mismatch[:8],
+                stale[:8],
+            )
+            self.tree.clear_commands(guild=guild_object)
             self.tree.copy_global_to(guild=guild_object)
-            guild_synced = await self.tree.sync(guild=guild_object)
-            logger.info("development guild commands synchronized during setup guild=%s count=%s", settings.discord_guild_id, len(guild_synced))
+            synced = await self.tree.sync(guild=guild_object)
+            remote = await self.tree.fetch_commands(guild=guild_object)
+            remote_signatures = _remote_command_signatures(remote)
+            mismatch = sorted(set(local) - set(remote_signatures))
+            stale = sorted(
+                name for name in set(local) & set(remote_signatures)
+                if local[name][2] != remote_signatures[name][2]
+            )
+            if mismatch or stale:
+                raise RuntimeError(
+                    f"guild command synchronization mismatch: missing={mismatch[:8]} stale={stale[:8]}"
+                )
+        logger.info(
+            "guild slash commands synchronized guild=%s top_level=%s executable=%s",
+            guild_id,
+            len(synced),
+            len(remote_signatures),
+        )
+        return synced
+
+    async def _ensure_registered_guilds(self) -> None:
+        if not self.guilds:
+            return
+        try:
+            async with session_factory() as session:
+                for guild in self.guilds:
+                    await ensure_guild(session, guild.id, guild.name, guild.owner_id, guild.icon.url if guild.icon else None)
+                await session.commit()
+        except SQLAlchemyError:
+            logger.exception("guild bootstrap persistence failed")
+
+    async def _sync_command_scopes(self) -> None:
+        settings = get_settings()
+        if settings.app_env == "production":
+            synced = await self.tree.sync()
+            logger.info("global slash commands synchronized count=%s environment=production", len(synced))
+            for guild in self.guilds:
+                guild_object = discord.Object(id=guild.id)
+                self.tree.clear_commands(guild=guild_object)
+                await self.tree.sync(guild=guild_object)
+            self._production_command_sync_complete = True
+            return
+
+        await self._clear_global_commands()
+        target_ids = [settings.discord_guild_id] if settings.discord_guild_id else [guild.id for guild in self.guilds]
+        for guild_id in sorted(set(value for value in target_ids if value)):
+            await self._sync_guild_commands(guild_id)
+        self._development_guild_sync_complete = True
 
     async def on_ready(self) -> None:
+        await self._ensure_registered_guilds()
         settings = get_settings()
-        if settings.app_env != "production" and not getattr(self, "_development_guild_sync_complete", False):
-            target_ids = [settings.discord_guild_id] if settings.discord_guild_id else [guild.id for guild in self.guilds]
-            sync_success = True
-            for guild_id in sorted(set(value for value in target_ids if value)):
-                guild_object = discord.Object(id=guild_id)
+        sync_flag = "_production_command_sync_complete" if settings.app_env == "production" else "_development_guild_sync_complete"
+        async with self._command_sync_lock:
+            if not getattr(self, sync_flag, False):
                 try:
-                    self.tree.copy_global_to(guild=guild_object)
-                    synced = await self.tree.sync(guild=guild_object)
-                    logger.info("development guild commands synchronized guild=%s count=%s", guild_id, len(synced))
+                    await self._sync_command_scopes()
                 except discord.HTTPException:
-                    sync_success = False
-                    logger.exception("development guild command sync failed guild=%s", guild_id)
-            self._development_guild_sync_complete = sync_success
+                    logger.exception("slash command synchronization failed environment=%s", settings.app_env)
         logger.info("logged in as %s", self.user)
 
     async def close(self) -> None:
@@ -86,12 +166,11 @@ class BNBot(commands.Bot):
             await session.commit()
         settings = get_settings()
         if settings.app_env != "production":
-            try:
-                guild_object = discord.Object(id=guild.id)
-                self.tree.copy_global_to(guild=guild_object)
-                await self.tree.sync(guild=guild_object)
-            except discord.HTTPException:
-                logger.exception("development guild command sync failed guild=%s", guild.id)
+            async with self._command_sync_lock:
+                try:
+                    await self._sync_guild_commands(guild.id)
+                except discord.HTTPException:
+                    logger.exception("development guild command sync failed guild=%s", guild.id)
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         async with session_factory() as session:
@@ -104,7 +183,7 @@ class BNBot(commands.Bot):
     async def on_member_join(self, member: discord.Member) -> None:
         async with session_factory() as session:
             await ensure_guild(session, member.guild.id, member.guild.name, member.guild.owner_id, member.guild.icon.url if member.guild.icon else None)
-            await ensure_user(session, member.id, str(member), member.display_name, member.display_avatar.url)
+            await ensure_user(session, member.id, member.name, member.display_name, member.display_avatar.url, member.banner.url if member.banner else None, member.bot)
             await ensure_member(session, member.guild.id, member.id, member.joined_at)
             await session.commit()
         antiraid = self.get_cog("AntiRaidCog")
@@ -137,7 +216,7 @@ class BNBot(commands.Bot):
             async with session_factory() as session:
                 guild = message.guild
                 await ensure_guild(session, guild.id, guild.name, guild.owner_id, guild.icon.url if guild.icon else None)
-                await ensure_user(session, message.author.id, message.author.name, message.author.display_name, message.author.display_avatar.url)
+                await ensure_user(session, message.author.id, message.author.name, message.author.display_name, message.author.display_avatar.url, message.author.banner.url if message.author.banner else None, message.author.bot)
                 await ensure_member(session, guild.id, message.author.id, message.author.joined_at)
                 bucket = message.created_at.replace(minute=0, second=0, microsecond=0)
                 await record_message(session, guild.id, message.author.id, message.channel.id, message.id, len(message.content), bucket)

@@ -4,13 +4,13 @@ from decimal import Decimal
 import discord
 
 COLORS = {
-    "system": 0x20252B,
-    "economy": 0x178B63,
-    "progression": 0x6D55C7,
-    "moderation": 0xC86B52,
-    "community": 0x2C7885,
-    "security": 0x9F4658,
-    "admin": 0xB38A46,
+    "system": 0x24272B,
+    "economy": 0x3D6E5C,
+    "progression": 0x625277,
+    "moderation": 0x8A554A,
+    "community": 0x3F6870,
+    "security": 0x75494A,
+    "admin": 0x7B6844,
 }
 
 SECTIONS = {
@@ -21,6 +21,16 @@ SECTIONS = {
     "community": "comunidade",
     "security": "segurança",
     "admin": "administração",
+}
+
+SECTION_MARKS = {
+    "system": "◆",
+    "economy": "◇",
+    "progression": "✦",
+    "moderation": "■",
+    "community": "○",
+    "security": "!",
+    "admin": "§",
 }
 
 STATUS = {
@@ -34,10 +44,23 @@ STATUS = {
 }
 
 
+def _clean_title(title: str) -> str:
+    cleaned = title.strip()
+    if cleaned.upper().startswith("BN /"):
+        cleaned = cleaned[3:].strip()
+    return cleaned
+
+
 def embed(title: str, description: str | None = None, section: str = "system") -> discord.Embed:
-    result = discord.Embed(title=title, description=description, color=COLORS.get(section, COLORS["system"]))
-    result.set_author(name=f"BN / {SECTIONS.get(section, section)}")
-    result.set_footer(text=f"BN Bot · {SECTIONS.get(section, section)}")
+    section_label = SECTIONS.get(section, section)
+    mark = SECTION_MARKS.get(section, "◆")
+    result = discord.Embed(
+        title=f"{mark}  {_clean_title(title)}",
+        description=description,
+        color=COLORS.get(section, COLORS["system"]),
+    )
+    result.set_author(name=f"BN Bot  ·  {section_label.upper()}")
+    result.set_footer(text=f"BN Bot · {section_label}")
     return result
 
 
@@ -110,10 +133,8 @@ def add_result(embed_obj: discord.Embed, label: str, value: str, inline: bool = 
 
 
 def ledger(rows: list[tuple[str, str]], width: int = 14) -> str:
-    longest = max((len(label) for label, _ in rows), default=0)
-    label_width = min(max(longest, width), 22)
-    content = "\n".join(f"{label:<{label_width}}  {value}" for label, value in rows)
-    return f"```text\n{content}\n```"
+    _ = width
+    return "\n".join(f"**{label}**  {value}" for label, value in rows)
 
 
 def divider(label: str) -> str:

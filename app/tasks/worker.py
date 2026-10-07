@@ -1,4 +1,5 @@
 import logging
+import discord
 from discord.ext import tasks
 from sqlalchemy import select
 from app.core.db import session_factory
@@ -56,7 +57,10 @@ class Worker:
                                         channel = None
                         if channel is not None:
                             try:
-                                await channel.send(f"<@{reminder.user_id}> {reminder.message}")
+                                await channel.send(
+                                    f"<@{reminder.user_id}> {reminder.message}",
+                                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                                )
                                 delivered = True
                             except Exception:
                                 logger.exception("reminder channel delivery failed channel=%s reminder=%s", reminder.channel_id, reminder.id)
@@ -78,15 +82,34 @@ class Worker:
                 rows = list(result.scalars())
                 for record in rows:
                     guild = self.bot.get_guild(record.guild_id)
-                    if guild is not None:
+                    delete_record = False
+                    if guild is None:
+                        logger.warning("temporary role cleanup deferred; guild unavailable guild=%s user=%s role=%s", record.guild_id, record.user_id, record.role_id)
+                        continue
+                    else:
                         member = guild.get_member(record.user_id)
+                        if member is None:
+                            try:
+                                member = await guild.fetch_member(record.user_id)
+                            except discord.NotFound:
+                                member = None
+                                delete_record = True
+                            except discord.HTTPException:
+                                logger.exception("temporary role member fetch failed guild=%s user=%s", record.guild_id, record.user_id)
+                                continue
                         role = guild.get_role(record.role_id)
-                        if member and role and role in member.roles:
+                        if member is None or role is None or role not in member.roles:
+                            delete_record = True
+                        else:
                             try:
                                 await member.remove_roles(role, reason=record.reason)
-                            except Exception:
+                                delete_record = True
+                            except discord.NotFound:
+                                delete_record = True
+                            except discord.HTTPException:
                                 logger.exception("temporary role cleanup failed guild=%s user=%s", record.guild_id, record.user_id)
-                    await session.delete(record)
+                    if delete_record:
+                        await session.delete(record)
                 await session.commit()
         except Exception:
             logger.exception("temporary roles worker iteration failed")

@@ -14,7 +14,7 @@ from app.models import Experience, GuildSettings, Member, Report, Suggestion, Ti
 from app.services.community import add_poll_vote, assign_ticket, cast_suggestion_vote, create_ticket, end_giveaway, end_poll, enter_giveaway, open_items, save_ticket_transcript, set_ticket_status, update_report, update_suggestion, validate_poll_options
 from app.services.cooldowns import check_and_set
 from app.core.validation import parse_snowflake
-from app.discord.theme import embed, number, duration, user_line, bar, ledger, STATUS, percent
+from app.discord.theme import embed, number, duration, user_line, bar, ledger, STATUS, percent, status_line
 
 logger = logging.getLogger("bn_bot.discord.community")
 
@@ -107,6 +107,44 @@ def parse_ids(value: str | list[int] | tuple[int, ...] | None, limit: int = 10) 
 
 def chunk_text(text: str, size: int = 1800) -> list[str]:
     return [text[index:index + size] for index in range(0, len(text), size)] or [""]
+
+
+def add_line_fields(page: discord.Embed, title: str, lines: list[str], limit: int = 1024) -> None:
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+    for line in lines:
+        clean = str(line)
+        extra = len(clean) + (1 if current else 0)
+        if current and length + extra > limit:
+            chunks.append("\n".join(current))
+            current = [clean]
+            length = len(clean)
+        else:
+            current.append(clean)
+            length += extra
+    if current:
+        chunks.append("\n".join(current))
+    if not chunks:
+        chunks = ["Sem dados."]
+    for index, chunk in enumerate(chunks, start=1):
+        suffix = f" · {index}/{len(chunks)}" if len(chunks) > 1 else ""
+        page.add_field(name=f"{title}{suffix}", value=chunk[:limit], inline=False)
+
+
+def compact_mentions(ids: list[int], limit: int = 3000) -> str:
+    parts: list[str] = []
+    for user_id in ids:
+        mention = f"<@{user_id}>"
+        candidate = ", ".join(parts + [mention])
+        if len(candidate) > limit:
+            break
+        parts.append(mention)
+    omitted = len(ids) - len(parts)
+    text = ", ".join(parts) if parts else "nenhum vencedor"
+    if omitted:
+        text = f"{text} · +{omitted} outros vencedores"
+    return text
 
 
 class BNComponentView(discord.ui.View):
@@ -279,9 +317,9 @@ class CommunityCog(commands.Cog):
                 page = await self.build_giveaway_message(giveaway, entry_count)
                 await message.edit(embed=page, view=GiveawayView(self, giveaway.id))
             else:
-                winner_ids = safe_int_list(requirements.get("winner_ids", []), 50)
+                winner_ids = safe_int_list(requirements.get("winner_ids", []), 10000)
                 page = await self.build_giveaway_message(giveaway, entry_count)
-                page.description = f"{giveaway.prize}\n\n**Vencedores:** {', '.join(f'<@{user_id}>' for user_id in winner_ids) or 'nenhum vencedor'}"
+                page.description = f"{giveaway.prize}\n\n**Vencedores:** {compact_mentions(winner_ids)}"
                 await message.edit(embed=page, view=None)
         except discord.HTTPException:
             logger.exception("giveaway panel refresh failed giveaway=%s", giveaway_id)
@@ -308,7 +346,7 @@ class CommunityCog(commands.Cog):
             page = embed("BN / ENQUETE", question, "community")
             total = sum(counts)
             rows = [f"**{index + 1}. {option}** · `{count}` · {percent(count, total)}\n{bar(count, total, 10)}" for index, (option, count) in enumerate(zip(options, counts))]
-            page.add_field(name=f"Votos · {number(total)}", value="\n".join(rows)[:1024], inline=False)
+            add_line_fields(page, f"Votos · {number(total)}", rows)
             leader = max(counts) if counts else 0
             page.add_field(name="Líder", value=f"`{number(leader)}` votos · {percent(leader, total)}" if total else "Sem votos ainda.", inline=False)
             page.set_footer(text=f"BN Bot · votação · termina {discord.utils.format_dt(poll.ends_at, 'R')}")
@@ -326,6 +364,11 @@ class CommunityCog(commands.Cog):
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
         }
         opener = guild.get_member(ticket.opener_id)
+        if opener is None:
+            try:
+                opener = await guild.fetch_member(ticket.opener_id)
+            except (discord.NotFound, discord.HTTPException):
+                opener = None
         if opener:
             overwrites[opener] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
         for role_id in staff_role_ids:
@@ -353,12 +396,24 @@ class CommunityCog(commands.Cog):
         return page
 
     async def restore_views(self) -> None:
+        async def load_batches(session, statement):
+            rows = []
+            offset = 0
+            while True:
+                batch = list((await session.execute(statement.limit(500).offset(offset))).scalars())
+                if not batch:
+                    return rows
+                rows.extend(batch)
+                if len(batch) < 500:
+                    return rows
+                offset += 500
+
         try:
             async with session_factory() as session:
-                suggestions = list((await session.execute(select(Suggestion).where(Suggestion.status.in_(["pending", "analysis"]), Suggestion.message_id.is_not(None)).limit(500))).scalars())
-                giveaways = list((await session.execute(select(Giveaway).where(Giveaway.status == "active", Giveaway.message_id.is_not(None)).limit(500))).scalars())
-                polls = list((await session.execute(select(Poll).where(Poll.status == "active", Poll.message_id.is_not(None)).limit(500))).scalars())
-                tickets = list((await session.execute(select(Ticket).where(Ticket.status.in_(["open", "closed"]), Ticket.panel_message_id.is_not(None)).limit(500))).scalars())
+                suggestions = await load_batches(session, select(Suggestion).where(Suggestion.status.in_(["pending", "analysis"]), Suggestion.message_id.is_not(None)).order_by(Suggestion.id.asc()))
+                giveaways = await load_batches(session, select(Giveaway).where(Giveaway.status == "active", Giveaway.message_id.is_not(None)).order_by(Giveaway.id.asc()))
+                polls = await load_batches(session, select(Poll).where(Poll.status == "active", Poll.message_id.is_not(None)).order_by(Poll.id.asc()))
+                tickets = await load_batches(session, select(Ticket).where(Ticket.status.in_(["open", "reopened", "closed"]), Ticket.panel_message_id.is_not(None)).order_by(Ticket.id.asc()))
         except Exception:
             logger.exception("community view restoration failed")
             return
@@ -419,6 +474,7 @@ class CommunityCog(commands.Cog):
                 await respond(interaction, f"Você já abriu um ticket recentemente. Aguarde {cooldown}s.", ephemeral=True)
                 return
             ticket_row = await create_ticket(session, guild.id, interaction.user.id, category, priority, reason)
+            ticket_record_id = ticket_row.id
             channel: discord.TextChannel | None = None
             try:
                 channel = await self.ensure_ticket_channel(guild, ticket_row)
@@ -436,14 +492,15 @@ class CommunityCog(commands.Cog):
                     try:
                         await channel.delete(reason="BN Bot cleanup após falha ao criar ticket")
                     except discord.HTTPException:
-                        logger.exception("ticket cleanup failed ticket=%s", ticket_row.id)
+                        logger.exception("ticket cleanup failed ticket=%s", ticket_record_id)
                 logger.exception("ticket creation failed guild=%s user=%s", guild.id, interaction.user.id)
                 await respond(interaction, "Não foi possível criar o ticket. Verifique se o BN Bot possui Manage Channels.", ephemeral=True)
                 return
         self.registered_views.add(f"ticket:{ticket_row.id}")
         page = embed(f"BN / TICKET #{ticket_row.id}", "Chamado aberto e pronto para atendimento.", "community")
         page.add_field(name="Canal", value=f"<#{ticket_row.channel_id}>", inline=True)
-        page.add_field(name="Prioridade", value=f"`{STATUS_LABELS.get(priority, priority)}`", inline=True)
+        priority_labels = {"low": "baixa", "normal": "normal", "high": "alta", "urgent": "urgente"}
+        page.add_field(name="Prioridade", value=f"`{priority_labels.get(priority, priority)}`", inline=True)
         page.add_field(name="Categoria", value=f"`{category}`", inline=True)
         page.add_field(name="Próximo passo", value="Use o painel dentro do ticket para assumir ou encerrar o chamado.", inline=False)
         await respond(interaction, embed=page, ephemeral=True)
@@ -682,6 +739,7 @@ class CommunityCog(commands.Cog):
             row = Suggestion(id=secrets.randbits(62), guild_id=guild.id, author_id=interaction.user.id, channel_id=target.id, content=content, status="pending", upvotes=0, downvotes=0, staff_note=None, message_id=None, created_at=now, updated_at=now)
             session.add(row)
             await session.flush()
+            suggestion_record_id = row.id
             message = None
             try:
                 message = await target.send(embed=await self.build_suggestion_message(row), view=SuggestionView(self, row.id))
@@ -693,7 +751,7 @@ class CommunityCog(commands.Cog):
                     try:
                         await message.delete()
                     except discord.HTTPException:
-                        logger.exception("suggestion cleanup failed suggestion=%s", row.id)
+                        logger.exception("suggestion cleanup failed suggestion=%s", suggestion_record_id)
                 raise
         self.registered_views.add(f"suggestion:{row.id}")
         page = embed(f"BN / SUGESTÃO #{row.id}", "Sugestão publicada para a comunidade.", "community")
@@ -883,6 +941,7 @@ class CommunityCog(commands.Cog):
             row = Giveaway(id=secrets.randbits(62), guild_id=guild.id, channel_id=channel.id, prize=prize, winners=winners, ends_at=now + timedelta(minutes=duration_minutes), requirements=requirements, status="active", message_id=None, created_at=now, updated_at=now)
             session.add(row)
             await session.flush()
+            giveaway_record_id = row.id
             message = None
             try:
                 message = await channel.send(embed=await self.build_giveaway_message(row, 0), view=GiveawayView(self, row.id))
@@ -894,7 +953,7 @@ class CommunityCog(commands.Cog):
                     try:
                         await message.delete()
                     except discord.HTTPException:
-                        logger.exception("giveaway cleanup failed giveaway=%s", row.id)
+                        logger.exception("giveaway cleanup failed giveaway=%s", giveaway_record_id)
                 raise
         self.registered_views.add(f"giveaway:{row.id}")
         page = await self.build_giveaway_message(row, 0)
@@ -939,7 +998,7 @@ class CommunityCog(commands.Cog):
                 return
             result = await session.execute(select(GiveawayEntry.user_id).where(GiveawayEntry.giveaway_id == giveaway_id))
             entrants = [int(row[0]) for row in result.all()]
-            previous = set(safe_int_list((giveaway.requirements or {}).get("winner_ids", []), 50))
+            previous = set(safe_int_list((giveaway.requirements or {}).get("winner_ids", []), 10_000))
             candidates = [user_id for user_id in entrants if user_id not in previous]
             if not candidates:
                 await respond(interaction, "Não existem participantes disponíveis para reroll.", ephemeral=True)
@@ -1046,7 +1105,11 @@ class CommunityCog(commands.Cog):
             row = await session.get(Giveaway, giveaway_id)
             if row is None or row.guild_id != guild.id or row.status != "active":
                 return None
-            winners = await end_giveaway(session, giveaway_id)
+            try:
+                winners = await end_giveaway(session, giveaway_id)
+            except ValueError:
+                await session.rollback()
+                return None
             message_id = row.message_id
             channel_id = row.channel_id
             await session.commit()
@@ -1054,7 +1117,10 @@ class CommunityCog(commands.Cog):
         channel = self.resolve_channel(guild, channel_id)
         if isinstance(channel, (discord.TextChannel, discord.Thread)):
             try:
-                await channel.send(f"Sorteio #{giveaway_id} encerrado. Vencedores: {', '.join(f'<@{user_id}>' for user_id in winners) or 'nenhum vencedor'}")
+                await channel.send(
+                    f"Sorteio #{giveaway_id} encerrado. Vencedores: {', '.join(f'<@{user_id}>' for user_id in winners) or 'nenhum vencedor'}",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
             except discord.HTTPException:
                 logger.exception("giveaway result publication failed giveaway=%s", giveaway_id)
         return winners
@@ -1122,9 +1188,10 @@ class CommunityCog(commands.Cog):
                 row = Poll(guild_id=guild.id, channel_id=channel.id, question=question[:2000], options=parsed, ends_at=now + timedelta(minutes=duration_minutes), status="active", message_id=None, created_at=now, updated_at=now)
                 session.add(row)
                 await session.flush()
+                poll_record_id = row.id
                 page = embed("BN / ENQUETE", question[:4000], "community")
                 rows = [f"**{index + 1}.** {option} · `0`" for index, option in enumerate(parsed)]
-                page.add_field(name=f"Opções · {len(parsed)}", value="\n".join(rows)[:1024], inline=False)
+                add_line_fields(page, f"Opções · {len(parsed)}", rows)
                 page.add_field(name="Votos", value="Nenhum voto ainda.", inline=False)
                 page.set_footer(text=f"BN Bot · votação · termina {discord.utils.format_dt(row.ends_at, 'R')}")
                 message = None
@@ -1138,7 +1205,7 @@ class CommunityCog(commands.Cog):
                         try:
                             await message.delete()
                         except discord.HTTPException:
-                            logger.exception("poll cleanup failed poll=%s", row.id)
+                            logger.exception("poll cleanup failed poll=%s", poll_record_id)
                     raise
         except Exception:
             logger.exception("poll creation failed guild=%s", guild.id)
@@ -1172,7 +1239,8 @@ class CommunityCog(commands.Cog):
             for index, (option, count) in enumerate(zip(options, counts))
         )
         page = embed("BN / ENQUETE ENCERRADA", "A votação foi finalizada.", "community")
-        page.add_field(name="Resultado", value=summary[:1024], inline=False)
+        result_rows = summary.split("\n") if summary else ["Sem votos."]
+        add_line_fields(page, "Resultado", result_rows)
         page.add_field(name="Total", value=f"`{number(sum(counts))}` votos", inline=True)
         await interaction.followup.send(embed=page, ephemeral=True)
 
@@ -1195,7 +1263,8 @@ class CommunityCog(commands.Cog):
         page = embed("BN / VOTO", "Seu voto foi registrado.", "community")
         page.add_field(name="Escolha", value=f"**{selected_option}**", inline=False)
         page.add_field(name="Total", value=f"`{number(sum(counts))}` votos", inline=True)
-        page.add_field(name="Distribuição", value="\n".join(f"{index + 1}. {option} · `{count}` · {percent(count, sum(counts))}" for index, (option, count) in enumerate(zip(options, counts)))[:1024], inline=False)
+        distribution_rows = [f"{index + 1}. {option} · `{count}` · {percent(count, sum(counts))}" for index, (option, count) in enumerate(zip(options, counts))]
+        add_line_fields(page, "Distribuição", distribution_rows)
         await interaction.followup.send(embed=page, ephemeral=True)
 
     async def finish_poll(self, guild: discord.Guild | None, poll_id: int):
@@ -1205,7 +1274,11 @@ class CommunityCog(commands.Cog):
             row = await session.get(Poll, poll_id)
             if row is None or row.guild_id != guild.id or row.status != "active":
                 return None
-            counts = await end_poll(session, poll_id)
+            try:
+                counts = await end_poll(session, poll_id)
+            except ValueError:
+                await session.rollback()
+                return None
             options = list(row.options)
             message_id = row.message_id
             channel_id = row.channel_id
@@ -1219,7 +1292,7 @@ class CommunityCog(commands.Cog):
                 message = await channel.fetch_message(message_id)
                 result_text = "\n".join(f"**{index + 1}. {option}** · `{count}`" for index, (option, count) in enumerate(zip(options, counts)))
                 page = embed("BN / ENQUETE ENCERRADA", question[:4000], "community")
-                page.add_field(name="Resultados", value=result_text[:1024], inline=False)
+                add_line_fields(page, "Resultados", result_text.split("\n") if result_text else ["Sem votos."])
                 page.add_field(name="Total", value=f"`{number(sum(counts))}` votos", inline=True)
                 page.add_field(name="Status", value="`encerrada`", inline=True)
                 await message.edit(embed=page, view=None)

@@ -1,5 +1,6 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 from app.models import Experience
 from app.core.time import utc_now
 
@@ -20,8 +21,16 @@ async def add_xp(session: AsyncSession, guild_id: int, user_id: int, amount: int
     row = result.scalar_one_or_none()
     now = utc_now()
     if row is None:
-        row = Experience(guild_id=guild_id, user_id=user_id, total_xp=0, level=0, rewarded_level=0, created_at=now, updated_at=now)
-        session.add(row)
+        try:
+            async with session.begin_nested():
+                row = Experience(guild_id=guild_id, user_id=user_id, total_xp=0, level=0, rewarded_level=0, created_at=now, updated_at=now)
+                session.add(row)
+                await session.flush()
+        except IntegrityError:
+            result = await session.execute(select(Experience).where(Experience.guild_id == guild_id, Experience.user_id == user_id).with_for_update())
+            row = result.scalar_one_or_none()
+            if row is None:
+                raise
     old_level = row.level
     row.total_xp += amount
     row.level = level_from_xp(row.total_xp)

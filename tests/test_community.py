@@ -98,3 +98,24 @@ async def test_end_giveaway_persists_winners() -> None:
     assert set(winners).issubset({101, 102, 103})
     assert giveaway.status == "ended"
     assert set(giveaway.requirements["winner_ids"]) == set(winners)
+
+
+@pytest.mark.asyncio
+async def test_end_giveaway_rejects_non_active_state() -> None:
+    giveaway = Giveaway(id=21, guild_id=100, channel_id=300, prize="Teste", winners=1, ends_at=timestamp(), requirements={}, status="cancelled", message_id=None, created_at=timestamp(), updated_at=timestamp())
+    session = GiveawaySession({(Giveaway, 21): giveaway})
+    with pytest.raises(ValueError, match="not active"):
+        await end_giveaway(session, 21)
+
+
+@pytest.mark.asyncio
+async def test_end_poll_rejects_non_active_state() -> None:
+    from app.models import Poll
+    from app.services.community import end_poll
+    poll = Poll(id=22, guild_id=100, channel_id=300, question="Q?", options=["A", "B"], ends_at=timestamp(), status="cancelled", message_id=None, created_at=timestamp(), updated_at=timestamp())
+    class PollSession(GiveawaySession):
+        async def execute(self, statement):
+            return FakeResult([])
+    session = PollSession({(Poll, 22): poll})
+    with pytest.raises(ValueError, match="not active"):
+        await end_poll(session, 22)

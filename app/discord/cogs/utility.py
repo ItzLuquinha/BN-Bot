@@ -10,7 +10,7 @@ from app.core.db import session_factory
 from app.services.diagnostics import run_diagnostics
 from app.models import AuditLog, Reminder
 from app.core.time import utc_now
-from app.discord.theme import bar, embed, duration, number, line_chunks, ledger, status_line
+from app.discord.theme import bar, embed, duration, number, ledger, status_line
 
 logger = logging.getLogger("bn_bot.discord.utility")
 
@@ -22,16 +22,42 @@ class HelpSelect(discord.ui.Select):
         options = [discord.SelectOption(label="Tudo", value="all", description="Visão geral de todos os comandos")]
         for key, lines in categories.items():
             options.append(discord.SelectOption(label=key, value=key, description=f"{len(lines)} comandos"))
-        super().__init__(placeholder="Escolha uma área do BN Bot", options=options, custom_id="bn:help:category")
+        super().__init__(placeholder="Escolha uma área do BN Bot", options=options)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         value = self.values[0]
         lines = [line for category in self.categories.values() for line in category] if value == "all" else self.categories.get(value, [])
-        title = "BN / COMANDOS" if value == "all" else f"BN / {value.upper()}"
-        page = embed(title, "\n".join(lines[:24]) or "Nenhum comando registrado.", "system")
-        total = max(len(lines), 1)
-        page.add_field(name="Carga do módulo", value=f"{bar(len(lines), total, 12)}\n`{len(lines)}` comandos neste recorte", inline=False)
-        page.add_field(name="Navegação", value="Use o seletor abaixo para trocar de área.", inline=False)
+        title = "Comandos" if value == "all" else value
+        page = embed(title, "Escolha um módulo no menu para consultar os comandos disponíveis.", "system")
+        if value == "all":
+            for category, category_lines in self.categories.items():
+                page.add_field(
+                    name=f"{category} · {len(category_lines)}",
+                    value="\n".join(category_lines[:6]) or "Nenhum comando registrado.",
+                    inline=True,
+                )
+            page.add_field(
+                name="Navegação",
+                value="Abra uma categoria no menu para ver a lista completa.",
+                inline=False,
+            )
+        else:
+            page.add_field(
+                name=f"{len(lines)} comandos",
+                value="\n".join(lines[:24]) or "Nenhum comando registrado.",
+                inline=False,
+            )
+            if len(lines) > 24:
+                page.add_field(
+                    name="Exibição",
+                    value=f"Mostrando 24 de {len(lines)} comandos desta categoria.",
+                    inline=False,
+                )
+            page.add_field(
+                name="Navegação",
+                value="Use o menu acima para trocar de categoria.",
+                inline=False,
+            )
         await interaction.response.edit_message(embed=page, view=self.view)
 
 
@@ -49,6 +75,54 @@ class HelpView(discord.ui.View):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
+
+
+class TestallView(discord.ui.View):
+    def __init__(self, owner_id: int, pages: list[discord.Embed]) -> None:
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        self.pages = pages
+        self.page_index = 0
+        self._refresh()
+
+    def _refresh(self) -> None:
+        total = len(self.pages)
+        self.first_button.disabled = self.page_index == 0
+        self.previous_button.disabled = self.page_index == 0
+        self.page_button.label = f"{self.page_index + 1} / {total}"
+        self.next_button.disabled = self.page_index >= total - 1
+        self.last_button.disabled = self.page_index >= total - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Este relatório pertence a outra pessoa.", ephemeral=True)
+            return False
+        return True
+
+    async def _go(self, interaction: discord.Interaction, index: int) -> None:
+        self.page_index = max(0, min(index, len(self.pages) - 1))
+        self._refresh()
+        await interaction.response.edit_message(embed=self.pages[self.page_index], view=self)
+
+    @discord.ui.button(label="Primeira", style=discord.ButtonStyle.secondary, row=0)
+    async def first_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._go(interaction, 0)
+
+    @discord.ui.button(label="Anterior", style=discord.ButtonStyle.secondary, row=0)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._go(interaction, self.page_index - 1)
+
+    @discord.ui.button(label="1 / 1", style=discord.ButtonStyle.secondary, row=0, disabled=True)
+    async def page_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Próxima", style=discord.ButtonStyle.secondary, row=0)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._go(interaction, self.page_index + 1)
+
+    @discord.ui.button(label="Última", style=discord.ButtonStyle.secondary, row=0)
+    async def last_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._go(interaction, len(self.pages) - 1)
 
 
 class UtilityCog(commands.Cog):
@@ -151,6 +225,9 @@ class UtilityCog(commands.Cog):
         if not text:
             await interaction.response.send_message("O lembrete não pode estar vazio.", ephemeral=True)
             return
+        if len(text) > 2000:
+            await interaction.response.send_message("O lembrete pode ter no máximo 2000 caracteres.", ephemeral=True)
+            return
         channel_id = interaction.channel_id if delivery == "channel" else None
         channel = interaction.channel
         if delivery == "channel" and not isinstance(channel, (discord.TextChannel, discord.Thread)):
@@ -183,7 +260,7 @@ class UtilityCog(commands.Cog):
                 category = "Progressão"
             elif root in {"warn", "warns", "unwarn", "clearwarns", "timeout", "kick", "ban", "unban", "purge"}:
                 category = "Moderação"
-            elif root in {"ticket", "suggest", "suggestion-status", "report", "report-status", "giveaway", "poll", "community-config"}:
+            elif root in {"ticket", "ticket-close", "ticket-reopen", "ticket-claim", "ticket-config", "suggest", "suggestion-status", "report", "report-status", "giveaway", "poll", "community-config"}:
                 category = "Comunidade"
             elif root in {"automod", "antiraid"}:
                 category = "Segurança"
@@ -195,10 +272,15 @@ class UtilityCog(commands.Cog):
         categories = {name: values for name, values in groups.items() if values}
         lines = [line for values in categories.values() for line in values]
         counts = " · ".join(f"{name} `{len(values)}`" for name, values in categories.items())
-        page = embed("BN / COMANDOS", "Catálogo vivo do bot. Pense nele como o índice operacional do servidor.", "system")
-        page.add_field(name=f"Painel · {len(lines)} comandos", value="\n".join(lines[:16]) or "Nenhum comando registrado.", inline=False)
-        page.add_field(name="Mapa de módulos", value=ledger([(name, str(len(values))) for name, values in categories.items()]), inline=False)
-        page.add_field(name="Navegação", value="Escolha um módulo abaixo para abrir sua lista sem sair da mensagem.", inline=False)
+        page = embed("Comandos", "O índice do BN Bot, organizado por área e pensado para consulta rápida.", "system")
+        page.add_field(name=f"Disponíveis · {len(lines)}", value="Escolha uma categoria no menu abaixo.", inline=False)
+        for name, values in categories.items():
+            page.add_field(
+                name=f"{name} · {len(values)}",
+                value="\n".join(values[:4]) or "Nenhum comando registrado.",
+                inline=True,
+            )
+        page.add_field(name="Navegação", value="Abra uma categoria no menu para ver todos os comandos dela.", inline=False)
         view = HelpView(self, categories)
         await interaction.response.send_message(embed=page, view=view, ephemeral=True)
         try:
@@ -219,11 +301,16 @@ class UtilityCog(commands.Cog):
         passed = sum(result.ok for result in results)
         failed = len(results) - passed
         failed_results = [result for result in results if not result.ok]
-        chunks = [results[index:index + 8] for index in range(0, len(results), 8)]
+        per_page = 8
+        pages: list[discord.Embed] = []
+        chunks = [results[index:index + per_page] for index in range(0, len(results), per_page)]
+        page_count = len(chunks)
         for index, chunk in enumerate(chunks):
-            title = "BN / TESTALL" if index == 0 else f"BN / TESTALL · {index + 1}"
-            description = f"**{passed} OK** · **{failed} falhas** · `{len(results)} testes` · `{elapsed:.2f}s`" if index == 0 else "Continuação do relatório técnico"
-            page = embed(title, description, "system")
+            if index == 0:
+                description = f"**{passed} OK** · **{failed} falhas** · `{len(results)} testes` · `{elapsed:.2f}s`"
+            else:
+                description = f"Página {index + 1} de {page_count} · relatório técnico"
+            page = embed("BN / TESTALL", description, "system")
             for result in chunk:
                 marker = "✓" if result.ok else "×"
                 page.add_field(name=f"{marker} {result.name}", value=result.detail[:1024], inline=False)
@@ -231,7 +318,10 @@ class UtilityCog(commands.Cog):
                 summary = " · ".join(result.name for result in failed_results[:6]) if failed_results else "Integridade geral confirmada."
                 page.add_field(name="Leitura rápida", value=summary, inline=False)
                 page.add_field(name="Saúde", value=f"{bar(passed, len(results), 16)}\n`{passed}/{len(results)}` verificações OK", inline=False)
-            await interaction.followup.send(embed=page, ephemeral=True)
+            page.set_footer(text=f"BN Bot · sistema · página {index + 1}/{page_count}")
+            pages.append(page)
+        view = TestallView(interaction.user.id, pages)
+        await interaction.edit_original_response(embed=pages[0], view=view)
         try:
             async with session_factory() as session:
                 session.add(AuditLog(id=secrets.randbits(62), guild_id=guild.id, executor_id=interaction.user.id, action="diagnostic.testall", resource="bot", before_state=None, after_state={"passed": passed, "failed": failed, "checks": len(results), "elapsed_seconds": round(elapsed, 3), "failed_checks": [result.name for result in failed_results[:20]]}, created_at=utc_now()))

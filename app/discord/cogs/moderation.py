@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import timedelta
+from pathlib import Path
 import logging
 import secrets
 import discord
@@ -198,10 +199,18 @@ class ModerationCog(commands.Cog):
         await defer(interaction)
         await guild.ban(user, reason=reason[:500] if reason else None)
         persisted = await self.persist_punishment(guild.id, user.id, interaction.user.id, "ban", reason[:500] if reason else None)
-        page = embed("BN / BAN", f"**{user.display_name}** foi banido do servidor.", "moderation")
+        page = embed("BN / BAN", f"**BANIMENTO EXECUTADO**\n{user.mention} não pode mais entrar neste servidor.", "moderation")
+        page.set_thumbnail(url=user.display_avatar.url)
+        page.add_field(name="Alvo", value=f"{user.mention}\n`{user.id}`", inline=True)
         page.add_field(name="Registro", value=status_line("Auditoria", "salva" if persisted else "indisponível", "ok" if persisted else "warning"), inline=True)
+        page.add_field(name="Decisão", value="`BAN`", inline=True)
         page.add_field(name="Motivo", value=reason[:1024] if reason else "Não informado", inline=False)
-        await respond(interaction, embed=page)
+        media_path = Path(__file__).resolve().parents[2] / "assets" / "gavel-ban.gif"
+        if media_path.exists():
+            page.set_image(url="attachment://gavel-ban.gif")
+            await respond(interaction, embed=page, file=discord.File(media_path, filename="gavel-ban.gif"))
+        else:
+            await respond(interaction, embed=page)
 
     @app_commands.command(name="unban", description="Remove o ban de um usuário pelo ID.")
     @app_commands.guild_only()

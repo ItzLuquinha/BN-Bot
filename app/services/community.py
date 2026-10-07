@@ -55,6 +55,12 @@ async def set_ticket_status(session: AsyncSession, ticket_id: int, actor_id: int
         raise ValueError("ticket not found")
     if status not in {"open", "closed", "reopened"}:
         raise ValueError("invalid ticket status")
+    if status == "closed" and ticket.status != "open":
+        raise ValueError("ticket is not open")
+    if status == "reopened" and ticket.status != "closed":
+        raise ValueError("ticket is not closed")
+    if status == "open" and ticket.status != "open":
+        raise ValueError("ticket status must be reopened from closed")
     current = now()
     ticket.status = "open" if status == "reopened" else status
     ticket.updated_at = current
@@ -171,6 +177,8 @@ async def end_giveaway(session: AsyncSession, giveaway_id: int, winner_count: in
     giveaway = await session.get(Giveaway, giveaway_id, with_for_update=True)
     if giveaway is None:
         raise ValueError("giveaway not found")
+    if giveaway.status != "active":
+        raise ValueError("giveaway is not active")
     result = await session.execute(select(GiveawayEntry.user_id).where(GiveawayEntry.giveaway_id == giveaway_id))
     entrants = [int(row[0]) for row in result.all()]
     count = max(1, winner_count or giveaway.winners)
@@ -192,8 +200,16 @@ async def add_poll_vote(session: AsyncSession, poll_id: int, user_id: int, optio
     existing_result = await session.execute(select(PollVote).where(PollVote.poll_id == poll_id, PollVote.user_id == user_id).with_for_update())
     existing = existing_result.scalar_one_or_none()
     if existing is None:
-        session.add(PollVote(id=entity_id(), poll_id=poll_id, user_id=user_id, option_index=option_index, created_at=now()))
-    else:
+        try:
+            async with session.begin_nested():
+                session.add(PollVote(id=entity_id(), poll_id=poll_id, user_id=user_id, option_index=option_index, created_at=now()))
+                await session.flush()
+        except IntegrityError:
+            retry = await session.execute(select(PollVote).where(PollVote.poll_id == poll_id, PollVote.user_id == user_id).with_for_update())
+            existing = retry.scalar_one_or_none()
+            if existing is None:
+                raise
+    if existing is not None:
         existing.option_index = option_index
         existing.created_at = now()
     await session.flush()
@@ -213,6 +229,8 @@ async def end_poll(session: AsyncSession, poll_id: int) -> list[int]:
     poll = await session.get(Poll, poll_id, with_for_update=True)
     if poll is None:
         raise ValueError("poll not found")
+    if poll.status != "active":
+        raise ValueError("poll is not active")
     counts = await poll_counts(session, poll_id, len(poll.options))
     poll.status = "ended"
     poll.updated_at = now()

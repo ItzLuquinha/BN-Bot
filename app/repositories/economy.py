@@ -128,7 +128,7 @@ async def buy_item(session: AsyncSession, guild_id: int, user_id: int, item_id: 
 async def sell_item(session: AsyncSession, guild_id: int, user_id: int, item_id: int, quantity: int) -> Decimal:
     if quantity <= 0:
         raise ValueError("quantity must be positive")
-    item = await session.get(ShopItem, item_id)
+    item = await session.get(ShopItem, item_id, with_for_update=True)
     if item is None or item.guild_id != guild_id:
         raise NotFound()
     result = await session.execute(select(InventoryItem).where(InventoryItem.guild_id == guild_id, InventoryItem.user_id == user_id, InventoryItem.shop_item_id == item_id).with_for_update())
@@ -136,9 +136,13 @@ async def sell_item(session: AsyncSession, guild_id: int, user_id: int, item_id:
     if inv is None or inv.quantity < quantity:
         raise ValueError("not enough items")
     value = item.price * Decimal("0.5") * quantity
+    current = now()
     inv.quantity -= quantity
-    inv.updated_at = now()
+    inv.updated_at = current
+    if item.stock is not None:
+        item.stock += quantity
+        item.updated_at = current
     account = await get_or_create_account(session, guild_id, user_id, lock=True)
     account.wallet += value
-    session.add(EconomyTransaction(id=tx_id(), guild_id=guild_id, user_id=user_id, amount=value, kind="sale", note=item.name, created_at=now()))
+    session.add(EconomyTransaction(id=tx_id(), guild_id=guild_id, user_id=user_id, amount=value, kind="sale", note=item.name, created_at=current))
     return value

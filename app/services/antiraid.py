@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 import asyncio
+import math
 import logging
 import secrets
 from sqlalchemy import select
@@ -58,6 +59,14 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def clamp_quarantine_timeout_seconds(value: object, default: int = 900) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, 60), 2_419_200)
+
+
 def _safe_ids(value: object) -> list[int]:
     if not isinstance(value, (list, tuple, set)):
         return []
@@ -70,6 +79,10 @@ def _safe_ids(value: object) -> list[int]:
         if parsed > 0:
             result.add(parsed)
     return sorted(result)
+
+
+def merge_lockdown_guild_ids(expired_ids: list[int], pending_ids: list[int]) -> list[int]:
+    return list(dict.fromkeys([*expired_ids, *pending_ids]))
 
 
 def clamp_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -88,7 +101,8 @@ def clamp_config(config: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         result["new_account_seconds"] = DEFAULT_CONFIG["new_account_seconds"]
     try:
-        result["new_account_ratio"] = min(max(float(result["new_account_ratio"]), 0.0), 1.0)
+        ratio = float(result["new_account_ratio"])
+        result["new_account_ratio"] = min(max(ratio, 0.0), 1.0) if math.isfinite(ratio) else DEFAULT_CONFIG["new_account_ratio"]
     except (TypeError, ValueError):
         result["new_account_ratio"] = DEFAULT_CONFIG["new_account_ratio"]
     try:
@@ -161,21 +175,29 @@ class RaidWindowStore:
         new_key = self.key(context.guild_id, "new")
         users_key = self.key(context.guild_id, "users")
         score = now.timestamp()
-        member = f"{score:.6f}:{context.user_id}:{secrets.token_hex(4)}"
+        token = secrets.token_hex(12)
+        member = f"{score:.6f}:{context.user_id}:{token}"
         await self.redis.zadd(stamp_key, {member: score})
         cutoff = (now - timedelta(seconds=120)).timestamp()
         await self.redis.zremrangebyscore(stamp_key, 0, cutoff)
         if new_account:
             await self.redis.zadd(new_key, {member: score})
         await self.redis.zremrangebyscore(new_key, 0, cutoff)
-        await self.redis.lpush(users_key, str(context.user_id))
+        await self.redis.lpush(users_key, f"{token}\t{context.user_id}")
         await self.redis.ltrim(users_key, 0, 199)
         stamp_rows = await self.redis.zrange(stamp_key, 0, -1, withscores=True)
         new_rows = await self.redis.zrange(new_key, 0, -1, withscores=True)
-        users = [int(value) for value in await self.redis.lrange(users_key, 0, 199)]
-        timestamps = [datetime.fromtimestamp(float(item[1]), timezone.utc) for item in stamp_rows]
-        new_timestamps = [datetime.fromtimestamp(float(item[1]), timezone.utc) for item in new_rows]
-        return timestamps[:-1], new_timestamps[:-1] if new_account else new_timestamps, users[1:]
+        raw_users = [str(value) for value in await self.redis.lrange(users_key, 0, 199)]
+        timestamps = [datetime.fromtimestamp(float(item[1]), timezone.utc) for item in stamp_rows if str(item[0]) != member]
+        new_timestamps = [datetime.fromtimestamp(float(item[1]), timezone.utc) for item in new_rows if str(item[0]) != member]
+        users: list[int] = []
+        for value in raw_users:
+            if "\t" not in value:
+                continue
+            item_token, item_user_id = value.split("\t", 1)
+            if item_token != token:
+                users.append(int(item_user_id))
+        return timestamps, new_timestamps, users
 
     async def _add_memory(self, context: JoinContext, now: datetime, new_account: bool) -> tuple[list[datetime], list[datetime], list[int]]:
         guild_id = context.guild_id
@@ -237,7 +259,14 @@ async def evaluate_join(context: JoinContext) -> RaidDecision | None:
         now = utc_now()
         new_account = context.account_age_seconds is not None and context.account_age_seconds <= protection.new_account_seconds
         store = await get_store()
-        recent_joins, recent_new, recent_users = await store.add_join(context, now, new_account)
+        try:
+            recent_joins, recent_new, recent_users = await store.add_join(context, now, new_account)
+        except Exception:
+            if store.redis is None:
+                raise
+            logger.exception("Redis Anti-Raid indisponível durante registro; usando fallback local")
+            fallback_store = RaidWindowStore(None)
+            recent_joins, recent_new, recent_users = await fallback_store.add_join(context, now, new_account)
         context.recent_joins = recent_joins
         context.recent_new_accounts = recent_new
         context.recent_user_ids = recent_users
