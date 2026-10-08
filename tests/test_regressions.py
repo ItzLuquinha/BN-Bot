@@ -230,13 +230,16 @@ def test_testall_includes_remote_command_sync() -> None:
 def test_external_command_groups_are_replaced_with_current_definitions() -> None:
     admin_source = Path("app/discord/cogs/admin.py").read_text(encoding="utf-8")
     raid_source = Path("app/discord/cogs/antiraid.py").read_text(encoding="utf-8")
-    assert "bot.tree.add_command(admin_group, override=True)" in admin_source
-    assert "bot.tree.add_command(raid_group, override=True)" in raid_source
+    assert "if bot.tree.get_command(admin_group.name) is None:" in admin_source
+    assert "bot.tree.add_command(admin_group)" in admin_source
+    assert "if bot.tree.get_command(raid_group.name) is None:" in raid_source
+    assert "bot.tree.add_command(raid_group)" in raid_source
 
 
 def test_development_command_sync_is_guild_scoped() -> None:
     source = Path("app/discord/bot.py").read_text(encoding="utf-8")
-    assert "self.tree.copy_global_to(guild=guild_object)" in source
+    assert "self.tree.copy_global_to(guild=guild_object)" not in source
+    assert "self.tree.add_command(command, guild=guild_object)" in source
     assert "await self.tree.sync(guild=guild_object)" in source
 
 def test_discord_guild_id_is_configurable() -> None:
@@ -303,6 +306,13 @@ def test_utility_imports_all_visual_helpers_it_uses() -> None:
     assert 'status_line' in source.split('from app.discord.theme import ', 1)[1].split('\n', 1)[0]
     assert 'bar' in source.split('from app.discord.theme import ', 1)[1].split('\n', 1)[0]
 
+
+
+
+def test_project_audit_skips_secret_environment_files() -> None:
+    source = Path("scripts/audit.py").read_text(encoding="utf-8")
+    assert '".env"' in source
+    assert 'path.name in SKIP_FILES' in source
 
 def test_command_source_safety_diagnostic_is_registered() -> None:
     source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
@@ -395,10 +405,12 @@ def test_persistent_component_views_define_error_handler() -> None:
     assert "class PollView(BNComponentView)" in source
 
 
-def test_help_select_does_not_send_unverified_emoji_names() -> None:
+def test_tutorial_select_does_not_use_decorative_geometry() -> None:
     source = (Path(__file__).resolve().parents[1] / "app" / "discord" / "cogs" / "utility.py").read_text(encoding="utf-8")
-    assert 'emoji="◆"' not in source
-    assert 'emoji="◇"' not in source
+    assert "◆" not in source
+    assert "◇" not in source
+    assert "✓" not in source
+    assert "×" not in source
 
 
 def test_tree_error_handler_is_installed() -> None:
@@ -419,7 +431,8 @@ def test_app_command_group_registration_replaces_stale_definitions() -> None:
         ("app/discord/cogs/antiraid.py", "raid_group"),
     ):
         source = Path(relative).read_text(encoding="utf-8")
-        assert f"bot.tree.add_command({group_name}, override=True)" in source
+        assert f"if bot.tree.get_command({group_name}.name) is None:" in source
+        assert f"bot.tree.add_command({group_name})" in source
 
 
 def test_reward_claim_insert_and_wallet_credit_share_savepoint() -> None:
@@ -600,11 +613,11 @@ def test_embed_theme_removes_repetitive_branding_and_keeps_section_identity() ->
     assert 'result.set_footer(text=f"BN Bot · {section_label}")' in source
 
 
-def test_help_panel_does_not_show_a_fake_full_progress_bar() -> None:
+def test_tutorial_panel_does_not_show_a_fake_full_progress_bar() -> None:
     source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
     assert 'name="Carga do módulo"' not in source
-    assert 'name=f"Disponíveis · {len(lines)}"' in source
-    assert 'name=f"{name} · {len(values)}"' in source
+    assert 'name="Primeiro contato"' in source
+    assert 'name="Para a equipe"' in source
 
 
 def test_development_does_not_sync_commands_globally_from_setup_hook() -> None:
@@ -705,11 +718,11 @@ def test_analytics_diagnostic_counts_message_logs_with_sqlalchemy_in_clause() ->
 def test_discord_command_diagnostic_checks_global_and_guild_scopes() -> None:
     source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
     assert "global_remote = await bot.tree.fetch_commands()" in source
-    assert "comandos globais antigos" in source
+    assert "mesmo comando em guilda e global" in source
     assert "comandos de guilda antigos" in source
 
 
-def test_help_select_does_not_use_static_custom_id() -> None:
+def test_tutorial_select_does_not_use_static_custom_id() -> None:
     source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
     assert 'custom_id="bn:help:category"' not in source
 
@@ -727,10 +740,13 @@ def test_analytics_smoke_flushes_and_uses_unique_probe_ids() -> None:
     assert "await session.flush()" in source[source.index('async def _analytics_smoke'):source.index('def _automod_smoke')]
 
 
-def test_ban_action_has_custom_gavel_media() -> None:
-    source = Path("app/discord/cogs/moderation.py").read_text(encoding="utf-8")
-    assert '"gavel-ban.gif"' in source
-    assert 'attachment://gavel-ban.gif' in source
+def test_all_command_embeds_have_contextual_public_gifs() -> None:
+    source = Path("app/discord/theme.py").read_text(encoding="utf-8")
+    assert 'def gif_for_title(title: str, section: str = "system") -> str | None:' in source
+    assert "gif_url = gif_for_title(title, section)" in source
+    assert "if gif_url:" in source
+    for key in ("system", "economy", "moderation", "community", "security", "admin", "fun", "work", "money", "shopping", "purchase", "reward", "warning", "timeout", "kick", "ban", "unban", "purge", "support", "idea", "report", "giveaway", "poll", "lockdown", "respect", "coinflip", "dice", "rps", "eightball", "reminder", "robot", "celebrate", "kiss"):
+        assert f'"{key}": "https://' in source
 
 
 def test_critical_admin_commands_defer_before_any_work() -> None:
@@ -755,12 +771,15 @@ def test_antiraid_critical_commands_start_with_defer() -> None:
         assert defer_line == calls[0].lineno
 
 
-def test_help_categorizes_ticket_leaf_commands_as_community() -> None:
+def test_tutorial_categorizes_ticket_leaf_commands_as_community() -> None:
     source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
-    start = source.index('async def help')
-    block = source[start:source.index('categories =', start)]
+    start = source.index('async def tutorial')
+    block = source[start:source.index('page = embed("BN / TUTORIAL"', start)]
+    community_start = block.index('"comunidade":')
+    community_end = block.index('"seguranca":', community_start)
+    community = block[community_start:community_end]
     for name in ("ticket-close", "ticket-reopen", "ticket-claim", "ticket-config"):
-        assert f'"{name}"' in block
+        assert name in community
 
 
 def test_automod_timeout_does_not_persist_when_author_is_not_a_member() -> None:
@@ -784,7 +803,7 @@ def test_dashboard_confirms_mutating_security_and_admin_commands() -> None:
     start = source.index('CONFIRM_COMMANDS =')
     end = source.index('OPTION_PLACEHOLDERS', start)
     block = source[start:end]
-    for name in ("admin credit", "admin shop-add", "admin job-add", "automod rule-update", "antiraid configure"):
+    for name in ("admin credit", "admin shop-add", "admin job-add", "admin job-remove", "automod rule-update", "antiraid configure"):
         assert f'"{name}"' in block
 
 
@@ -803,7 +822,7 @@ def test_dashboard_parameter_panel_has_back_navigation() -> None:
 def test_remind_rejects_oversized_messages_instead_of_truncating() -> None:
     source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
     start = source.index("async def remind")
-    end = source.index('@app_commands.command(name="help"', start)
+    end = source.index('@app_commands.command(name="history"', start)
     block = source[start:end]
     assert "if len(text) > 2000:" in block
     assert "O lembrete pode ter no máximo 2000 caracteres." in block
@@ -813,7 +832,52 @@ def test_command_matrix_has_an_exact_expected_command_inventory() -> None:
     from app.services.command_matrix import EXPECTED_COMMANDS, audit_commands
     actual = {case.qualified_name for case in audit_commands()}
     assert actual == EXPECTED_COMMANDS
-    assert len(actual) == 76
+    assert len(actual) == len(EXPECTED_COMMANDS)
+
+
+
+def test_user_install_support_is_explicit_and_scoped_to_safe_commands() -> None:
+    bot_source = Path("app/discord/bot.py").read_text(encoding="utf-8")
+    assert "self.tree.allowed_installs = discord.app_commands.AppInstallationType(guild=True, user=False)" in bot_source
+    assert "self.tree.allowed_contexts = discord.app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False)" in bot_source
+    assert "async def _sync_user_installable_global_commands" in bot_source
+    assert "await self._sync_user_installable_global_commands()" in bot_source
+
+    safe_files = {
+        "app/discord/cogs/utility.py": ("ping", "uptime", "botinfo", "avatar", "tutorial"),
+        "app/discord/cogs/fun.py": ("coinflip", "dice", "rps", "eightball"),
+    }
+    for filename, names in safe_files.items():
+        source = Path(filename).read_text(encoding="utf-8")
+        for name in names:
+            start = source.find(f'@app_commands.command(name="{name}"')
+            assert start >= 0
+            block_start = source.rfind("@user_installable", 0, start)
+            assert block_start >= 0
+            assert start - block_start < 200
+
+
+def test_dm_install_message_has_rate_limit_and_server_and_user_install_links() -> None:
+    source = Path("app/discord/bot.py").read_text(encoding="utf-8")
+    start = source.index("    async def on_message")
+    end = source.index("    async def on_app_command_completion", start)
+    block = source[start:end]
+    assert 'bn:dm-install:{message.author.id}' in block
+    assert 'integration_type": "0"' in block
+    assert 'integration_type": "1"' in block
+    assert 'scope": "bot applications.commands"' in block
+    assert "client_id = self.application_id" in block
+    assert 'scope": "applications.commands"' in block
+    assert 'label="Adicionar ao servidor"' in block
+    assert 'label="Adicionar como App"' in block
+    assert 'allowed_mentions=discord.AllowedMentions.none()' in block
+
+
+def test_user_installable_commands_are_not_guild_install_only() -> None:
+    for filename in ("utility.py", "fun.py"):
+        source = Path("app/discord/cogs") / filename
+        text = source.read_text(encoding="utf-8")
+        assert "from app.discord.app_contexts import user_installable" in text
 
 
 def test_testall_uses_one_ephemeral_message_with_embed_pages() -> None:
@@ -836,6 +900,8 @@ def test_project_python_source_has_no_comments() -> None:
     root = Path(".")
     comments = []
     for path in root.rglob("*.py"):
+        if any(part in {".venv", "venv", "site-packages"} for part in path.parts):
+            continue
         text = path.read_text(encoding="utf-8")
         for token in tokenize.generate_tokens(io.StringIO(text).readline):
             if token.type == tokenize.COMMENT:

@@ -1,6 +1,6 @@
 # Commands
 
-`/balance`, `/bank`, `/deposit`, `/withdraw`, `/pay`, `/work`, `/daily`, `/weekly`, `/shop`, `/buy`, `/sell`, `/inventory`, `/profile`, `/rep`, `/reps`, `/leaderboard`, `/warn`, `/warns`, `/unwarn`, `/clearwarns`, `/timeout`, `/kick`, `/ban`, `/unban`, `/serverinfo`, `/userinfo`, `/avatar`, `/ping`, `/uptime`, `/help`, `/remind`, `/ticket`, `/ticket-close`, `/ticket-reopen`, `/ticket-claim`, `/ticket-config`, `/suggest`, `/suggestion-status`, `/report`, `/report-status`, `/community-config`.
+`/balance`, `/donate`, `/bank`, `/deposit`, `/withdraw`, `/pay`, `/daily`, `/weekly`, `/shop`, `/buy`, `/sell`, `/inventory`, `/transactions`, `/jobs`, `/job`, `/work`, `/profile`, `/rep`, `/reps`, `/leaderboard`, `/warn`, `/t-warn`, `/warns`, `/unwarn`, `/clearwarns`, `/timeout`, `/untimeout`, `/unmute`, `/kick`, `/ban`, `/unban`, `/serverinfo`, `/userinfo`, `/avatar`, `/ping`, `/uptime`, `/tutorial`, `/remind`, `/dashboard`, `/history`, `/ticket`, `/ticket-close`, `/ticket-reopen`, `/ticket-claim`, `/ticket-config`, `/suggest`, `/suggestion-status`, `/report`, `/report-status`, `/community-config`.
 
 
 ## AutoMod
@@ -42,3 +42,14 @@
 `/giveaway create` creates a giveaway with duration, winner count, role requirements, minimum level and minimum messages. `/giveaway end` ends it immediately. `/giveaway reroll` selects another winner without reusing previous winners. `/giveaway cancel` cancels an active giveaway.
 
 `/poll create` creates an interactive poll with 2 to 10 options. `/poll end` closes it immediately.
+
+`/history` mostra os últimos comandos usados, agrupados por categoria e acessível à equipe com Manage Server. `/admin job-remove` remove uma vaga com autocomplete e confirmação. `/praise` homenageia os três membros configurados pelo BN Bot.
+
+
+## Economy
+
+`/transactions` mostra o histórico financeiro do membro com filtros por entradas, saídas, transferências e compras. `/daily` e `/weekly` usam os valores configurados pelo administrador em `/admin rewards`, incluindo bônus de sequência. `/shop`, `/buy`, `/sell` e `/inventory` usam paginação e autocomplete para catálogos maiores.
+
+## Administration
+
+`/admin rewards` configura os valores base de daily e weekly e o bônus de sequência. `/admin shop-add` pode definir descrição, raridade, limite por membro, cooldown e janela de disponibilidade.

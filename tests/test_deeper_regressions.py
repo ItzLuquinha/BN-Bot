@@ -57,13 +57,12 @@ def test_dashboard_distinguishes_expired_discord_tokens_from_service_outages() -
 
 def test_automod_skips_invalid_rule_rows_instead_of_aborting_evaluation() -> None:
     source = Path("app/discord/cogs/automod.py").read_text(encoding="utf-8")
-    start = source.index("context = await collect_activity(context)")
+    start = source.index("for row in rule_rows:")
     end = source.index("whitelist =", start)
     block = source[start:end]
     assert "config_errors = validate_rule_config" in block
     assert "if config_errors:" in block
     assert "continue" in block
-    assert "valid_rule_rows.append(row)" in block
 
 
 def test_dashboard_redirects_expired_api_sessions_to_oauth_login() -> None:
@@ -93,18 +92,42 @@ def test_on_ready_backfills_existing_guilds_for_dashboard() -> None:
 
 def test_automod_invalid_rule_is_skipped_before_rule_evaluation() -> None:
     source = Path("app/discord/cogs/automod.py").read_text(encoding="utf-8")
-    block = source[source.index("rules = []"):source.index("whitelist =", source.index("rules = []"))]
-    assert "validate_rule_config(row.rule_type, dict(row.config or {}))" in block
+    start = source.index("for row in rule_rows:")
+    end = source.index("whitelist =", start)
+    block = source[start:end]
+    assert "validate_rule_config(row.rule_type, config)" in block
+    assert "if config_errors:" in block
     assert "continue" in block
-    assert "valid_rule_rows.append(row)" in block
+    assert "rules.append(_rule_definition(row))" in block
 
 
 def test_command_matrix_covers_all_handlers() -> None:
     from app.services.command_matrix import audit_summary
     ok, cases, issues = audit_summary()
     assert ok, issues
-    assert len(cases) == 76
+    assert len(cases) == len(EXPECTED_COMMANDS)
 
+
+
+
+def test_timeout_removal_commands_have_matching_permissions_and_api_calls() -> None:
+    source = Path("app/discord/cogs/moderation.py").read_text(encoding="utf-8")
+    for name in ("untimeout", "unmute"):
+        assert f'@app_commands.command(name="{name}"' in source
+        assert f'async def {name}' in source
+    assert '@app_commands.checks.has_permissions(moderate_members=True)' in source
+    assert 'await user.timeout(None' in source
+
+def test_development_guild_sync_does_not_copy_global_commands_into_guild_scope() -> None:
+    source = Path("app/discord/bot.py").read_text(encoding="utf-8")
+    block = source[source.index("async def _sync_guild_commands"):source.index("async def _sync_command_scopes", source.index("async def _sync_guild_commands"))]
+    assert 'self.tree.add_command(command, guild=guild_object)' in block
+    assert 'self.tree.copy_global_to(guild=guild_object)' not in block
+
+def test_guild_command_sync_verifies_guild_scoped_local_commands() -> None:
+    source = Path("app/discord/bot.py").read_text(encoding="utf-8")
+    block = source[source.index("async def _sync_guild_commands"):source.index("async def _sync_command_scopes", source.index("async def _sync_guild_commands"))]
+    assert 'self.tree.walk_commands(guild=guild_object)' in block
 
 def test_dashboard_is_registered_and_executable() -> None:
     bot = Path("app/discord/bot.py").read_text(encoding="utf-8")

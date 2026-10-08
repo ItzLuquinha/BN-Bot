@@ -347,7 +347,7 @@ def detect_rule(rule: RuleDefinition, context: MessageContext, now: datetime | N
         blocked = extensions & blocked_extensions
         too_many = len(context.attachments) > max_files
         too_large = total_size > max_size_mb * 1024 * 1024
-        outside_allowlist = bool(allowed_extensions and extensions and not extensions.issubset(allowed_extensions))
+        outside_allowlist = bool(allowed_extensions and (not extensions or not extensions.issubset(allowed_extensions)))
         if too_many or too_large or blocked or outside_allowlist:
             return AutoModDecision("attachments", 70, "arquivo ou conjunto de arquivos fora da política", {"count": len(context.attachments), "total_size": total_size, "blocked_extensions": sorted(blocked), "extensions": sorted(extensions)})
     elif rule.rule_type == "suspicious":

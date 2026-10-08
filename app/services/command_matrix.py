@@ -28,21 +28,21 @@ IO_FINAL_NAMES = {
 }
 
 EXPECTED_COMMANDS = {
-    "admin credit", "admin debit", "admin job-add", "admin shop-add", "admin timezone",
+    "admin credit", "admin debit", "admin job-add", "admin job-remove", "admin rewards", "admin shop-add", "admin timezone",
     "antiraid configure", "antiraid disable", "antiraid enable", "antiraid setup", "antiraid status", "antiraid unlock",
     "automod disable", "automod enable", "automod list-action", "automod list-add", "automod list-remove", "automod lists",
     "automod rule-add", "automod rule-delete", "automod rule-update", "automod rules", "automod setup", "automod status",
-    "avatar", "balance", "ban", "bank", "botinfo", "buy", "clearwarns", "community-config", "daily", "dashboard",
-    "deposit", "giveaway cancel", "giveaway create", "giveaway end", "giveaway reroll", "help", "inventory", "job", "jobs",
+    "avatar", "donate", "balance", "ban", "bank", "botinfo", "buy", "clearwarns", "community-config", "daily", "dashboard",
+    "deposit", "giveaway cancel", "giveaway create", "giveaway end", "giveaway reroll", "history", "inventory", "tutorial", "job", "jobs",
     "kick", "leaderboard", "pay", "ping", "poll create", "poll end", "profile", "purge", "remind", "rep", "report",
     "report-status", "reps", "sell", "serverinfo", "shop", "suggest", "suggestion-status", "testall", "ticket",
-    "ticket-claim", "ticket-close", "ticket-config", "ticket-reopen", "timeout", "unban", "unwarn", "uptime", "userinfo",
-    "warn", "warns", "weekly", "withdraw", "work",
+    "ticket-claim", "ticket-close", "ticket-config", "ticket-reopen", "timeout", "transactions", "unban", "unmute", "unwarn", "untimeout", "uptime", "userinfo",
+    "warn", "t-warn", "warns", "weekly", "withdraw", "work", "coinflip", "dice", "rps", "eightball", "kiss", "praise",
 }
 
 
 PROTECTED_COMMANDS = {
-    "warn", "warns", "unwarn", "clearwarns", "timeout", "kick", "ban", "unban", "purge",
+    "warn", "t-warn", "warns", "unwarn", "clearwarns", "timeout", "untimeout", "unmute", "kick", "ban", "unban", "purge",
     "ticket-close", "ticket-reopen", "ticket-claim", "ticket-config", "suggestion-status", "report-status",
     "community-config", "giveaway create", "giveaway end", "giveaway reroll", "giveaway cancel",
     "poll create", "poll end",
@@ -50,7 +50,7 @@ PROTECTED_COMMANDS = {
     "automod rule-delete", "automod list-action", "automod list-add", "automod list-remove",
     "automod rules", "automod lists", "automod status",
     "antiraid setup", "antiraid enable", "antiraid disable", "antiraid configure", "antiraid status", "antiraid unlock",
-    "admin credit", "admin debit", "admin shop-add", "admin job-add", "admin timezone",
+    "admin credit", "admin debit", "admin shop-add", "admin job-add", "admin job-remove", "admin rewards", "admin timezone",
 }
 
 EXPECTED_TOKENS: dict[str, tuple[str, ...]] = {
@@ -58,7 +58,7 @@ EXPECTED_TOKENS: dict[str, tuple[str, ...]] = {
     "bank": ("economy_service.balance",),
     "deposit": ("economy_service.deposit",),
     "withdraw": ("economy_service.withdraw",),
-    "pay": ("economy_service.transfer", "Você não pode transferir moedas para si mesmo"),
+    "pay": ("self.complete_pay", "Você não pode transferir moedas para si mesmo"),
     "daily": ("claim_reward", '"daily"'),
     "weekly": ("claim_reward", '"weekly"'),
     "shop": ("get_shop_items",),
@@ -66,17 +66,22 @@ EXPECTED_TOKENS: dict[str, tuple[str, ...]] = {
     "sell": ("sell_item",),
     "inventory": ("InventoryItem", "ShopItem"),
     "jobs": ("select(Job)",),
-    "job": ("UserJob", "job_id = job.id"),
+    "job": ("JobSelectView",),
     "work": ("economy_service.credit", "check_and_set"),
-    "profile": ("Experience", "Reputation", "EconomyAccount", "Member"),
+    "profile": ("Experience", "Reputation", "EconomyAccount", "Member", "voice_joined_at", "achievement"),
     "rep": ("give_reputation", "Você não pode conceder reputação a si mesmo"),
     "reps": ("Reputation",),
-    "leaderboard": ("kind.value", "Experience", "EconomyAccount", "Reputation", "Member"),
-    "warn": ("add_warning", "target_error"),
+    "leaderboard": ("kind.value", "Experience", "EconomyAccount", "Reputation", "Member", "page", "Sua posição"),
+    "warn": ("_create_warning",),
+    "t-warn": ("parse_twarn_duration", "expires_at = utc_now() + timedelta", "duration: str"),
+    "kiss": ("user.id == interaction.user.id", "page = embed", "BN / KISS", "discord.Member"),
+    "praise": ("rian_.3", "vixtuana", "gabriel31271", "BN / PRAISE"),
     "warns": ("list_warnings",),
     "unwarn": ("deactivate_warning",),
     "clearwarns": ("list_warnings", "row.active = False"),
     "timeout": ("target_error", "timeout("),
+    "untimeout": ("self._remove_timeout",),
+    "unmute": ("self._remove_timeout",),
     "kick": ("target_error", "kick("),
     "ban": ("target_error", "ban("),
     "unban": ("unban", "parse_snowflake"),
@@ -119,7 +124,10 @@ EXPECTED_TOKENS: dict[str, tuple[str, ...]] = {
     "admin debit": ("economy_service.debit",),
     "admin shop-add": ("ShopItem(",),
     "admin job-add": ("Job(",),
+    "admin job-remove": ("JobRemoveConfirmView",),
     "admin timezone": ("ZoneInfo",),
+    "admin rewards": ('config["rewards"]', "daily_amount", "weekly_amount", "streak_bonus_percent"),
+    "transactions": ("EconomyTransaction", "created_at", "kind"),
     "ping": ("self.bot.latency",),
     "uptime": ("time.monotonic",),
     "botinfo": ("discord.__version__", "self.bot.guilds"),
@@ -127,9 +135,11 @@ EXPECTED_TOKENS: dict[str, tuple[str, ...]] = {
     "userinfo": ("target.display_avatar", "target.created_at"),
     "avatar": ("target.display_avatar",),
     "remind": ("Reminder(", "timedelta"),
-    "help": ("walk_commands", "HelpView"),
+    "tutorial": ("TutorialView", "BN / TUTORIAL"),
+    "history": ("CommandUsage", "CATEGORY_LABELS", "desc(CommandUsage.used_at)"),
     "testall": ("run_diagnostics",),
     "dashboard": ("DashboardHomeView", "home_embed"),
+    "donate": ("paypal.me/RianBraga", "Apoiar via PayPal"),
 }
 
 
@@ -244,6 +254,21 @@ def audit_commands() -> list[CommandAuditCase]:
                 )
                 permission_guard = any("has_permissions" in value for value in decorators) or "is_staff(" in function_source or helper_guard
                 response_path = _response_path(calls)
+                if not response_path:
+                    helper_response_names = {
+                        call.func.attr
+                        for call in calls
+                        if isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "self"
+                    }
+                    for helper_name in helper_response_names:
+                        helper = next((item for item in cls.body if isinstance(item, ast.AsyncFunctionDef) and item.name == helper_name), None)
+                        if helper is not None:
+                            helper_calls = [value for value in ast.walk(helper) if isinstance(value, ast.Call)]
+                            if _response_path(helper_calls):
+                                response_path = True
+                                break
                 semantic = _semantic_issues(qualified, function_source)
                 if qualified in EXPECTED_TOKENS and "" in semantic:
                     semantic.remove("")
@@ -257,7 +282,7 @@ def case_issues(case: CommandAuditCase) -> list[str]:
         issues.append("sem resposta")
     if not case.defer_before_io:
         issues.append("I/O antes de defer")
-    if not case.guild_only and case.qualified_name not in {"ping", "uptime", "botinfo", "avatar", "help", "dashboard"}:
+    if not case.guild_only and case.qualified_name not in {"ping", "uptime", "botinfo", "avatar", "tutorial", "dashboard", "donate"}:
         issues.append("sem guild_only")
     if not case.semantic_ok:
         issues.append(f"contrato incompleto: {case.issue}")
@@ -268,10 +293,11 @@ def case_issues(case: CommandAuditCase) -> list[str]:
     return issues
 
 
-def audit_summary(expected_count: int = 76) -> tuple[bool, list[CommandAuditCase], list[str]]:
+def audit_summary(expected_count: int | None = None) -> tuple[bool, list[CommandAuditCase], list[str]]:
     cases = audit_commands()
     issues: list[str] = []
     actual = {case.qualified_name for case in cases}
+    expected_count = len(EXPECTED_COMMANDS) if expected_count is None else expected_count
     if len(cases) != expected_count:
         issues.append(f"quantidade de comandos: {len(cases)} != {expected_count}")
     missing = sorted(EXPECTED_COMMANDS - actual)

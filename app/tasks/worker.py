@@ -1,10 +1,11 @@
 import logging
+from datetime import timedelta
 import discord
 from discord.ext import tasks
 from sqlalchemy import select
 from app.core.db import session_factory
 from app.core.time import utc_now
-from app.models import Reminder, TemporaryRole
+from app.models import Reminder, TemporaryRole, Warning
 
 logger = logging.getLogger("bn_bot.tasks")
 
@@ -16,12 +17,14 @@ class Worker:
         self.temporary_roles.start()
         self.antiraid.start()
         self.community.start()
+        self.warnings.start()
 
     def close(self) -> None:
         self.reminders.cancel()
         self.temporary_roles.cancel()
         self.antiraid.cancel()
         self.community.cancel()
+        self.warnings.cancel()
 
     @tasks.loop(seconds=15)
     async def reminders(self) -> None:
@@ -143,4 +146,29 @@ class Worker:
 
     @community.before_loop
     async def before_community(self) -> None:
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(seconds=30)
+    async def warnings(self) -> None:
+        try:
+            async with session_factory() as session:
+                result = await session.execute(
+                    select(Warning)
+                    .where(
+                        Warning.active.is_(True),
+                        Warning.expires_at.is_not(None),
+                        Warning.expires_at <= utc_now(),
+                    )
+                    .limit(200)
+                    .with_for_update(skip_locked=True)
+                )
+                rows = list(result.scalars())
+                for warning in rows:
+                    warning.active = False
+                await session.commit()
+        except Exception:
+            logger.exception("timed warning cleanup iteration failed")
+
+    @warnings.before_loop
+    async def before_warnings(self) -> None:
         await self.bot.wait_until_ready()

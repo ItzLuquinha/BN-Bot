@@ -1,8 +1,11 @@
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import secrets
+import time
 from datetime import timedelta
+from dataclasses import dataclass
 from typing import Any
 import discord
 from discord import app_commands
@@ -76,12 +79,32 @@ def _rule_definition(row: AutoModRule) -> RuleDefinition:
 
 def _rule_badge(row: AutoModRule) -> str:
     state = "ATIVA" if row.enabled else "PAUSADA"
-    return f"`#{row.id}` · **{row.name[:32]}** · {state} · {row.rule_type} → {row.action}"
+    return f"`#{row.id}` · **{row.name[:32]}** · {state} · {row.rule_type} para {row.action}"
+
+
+AUTOMOD_CACHE_TTL = 15.0
+ACTIVITY_RULE_TYPES = {"spam", "flood", "duplicate", "similarity", "suspicious"}
+
+
+@dataclass(frozen=True, slots=True)
+class AutoModRuleSnapshot:
+    id: int
+    name: str
+    rule_type: str
+    action: str
+    enabled: bool
+    priority: int
+    channel_ids: tuple[int, ...]
+    role_ids: tuple[int, ...]
+    config: dict[str, Any]
 
 
 class AutoModCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._cache: dict[int, tuple[float, bool, str, tuple[RuleDefinition, ...], tuple[dict[str, str], ...], tuple[dict[str, str], ...], tuple[AutoModRuleSnapshot, ...]]] = {}
+        self._cache_locks: dict[int, asyncio.Lock] = {}
+        self._cache_locks_guard = asyncio.Lock()
 
     async def audit(self, guild_id: int, executor_id: int, action: str, resource: str, before: dict[str, Any] | None = None, after: dict[str, Any] | None = None) -> None:
         try:
@@ -91,15 +114,52 @@ class AutoModCog(commands.Cog):
         except Exception:
             logger.exception("audit persistence failed action=%s resource=%s", action, resource)
 
-    async def evaluate(self, message: discord.Message) -> tuple[Any, list[AutoModRule]]:
-        async with session_factory() as session:
-            settings = await session.get(GuildSettings, message.guild.id)
-            if settings is None or not settings.automod_enabled:
-                return None, []
-            rule_rows = list((await session.execute(select(AutoModRule).where(AutoModRule.guild_id == message.guild.id, AutoModRule.enabled.is_(True)).order_by(AutoModRule.priority.desc(), AutoModRule.id.asc()))).scalars())
-            if not rule_rows:
-                return None, []
-            entries_rows = list((await session.execute(select(AutoModListEntry).where(AutoModListEntry.guild_id == message.guild.id))).scalars())
+    async def invalidate_cache(self, guild_id: int) -> None:
+        self._cache.pop(guild_id, None)
+
+    async def _guild_cache_lock(self, guild_id: int) -> asyncio.Lock:
+        async with self._cache_locks_guard:
+            return self._cache_locks.setdefault(guild_id, asyncio.Lock())
+
+    async def _load_cache(self, guild_id: int) -> tuple[bool, str, tuple[RuleDefinition, ...], tuple[dict[str, str], ...], tuple[dict[str, str], ...], tuple[AutoModRuleSnapshot, ...]]:
+        cached = self._cache.get(guild_id)
+        if cached is not None and time.monotonic() - cached[0] < AUTOMOD_CACHE_TTL:
+            return cached[1:]
+        cache_lock = await self._guild_cache_lock(guild_id)
+        async with cache_lock:
+            cached = self._cache.get(guild_id)
+            if cached is not None and time.monotonic() - cached[0] < AUTOMOD_CACHE_TTL:
+                return cached[1:]
+            async with session_factory() as session:
+                settings = await session.get(GuildSettings, guild_id)
+                if settings is None or not settings.automod_enabled:
+                    value = (False, "delete", tuple(), tuple(), tuple(), tuple())
+                    self._cache[guild_id] = (time.monotonic(), *value)
+                    return value
+                rule_rows = list((await session.execute(select(AutoModRule).where(AutoModRule.guild_id == guild_id, AutoModRule.enabled.is_(True)).order_by(AutoModRule.priority.desc(), AutoModRule.id.asc()))).scalars())
+                entries_rows = list((await session.execute(select(AutoModListEntry).where(AutoModListEntry.guild_id == guild_id))).scalars())
+            rules: list[RuleDefinition] = []
+            snapshots: list[AutoModRuleSnapshot] = []
+            for row in rule_rows:
+                config = dict(row.config or {})
+                config_errors = validate_rule_config(row.rule_type, config)
+                if config_errors:
+                    logger.error("invalid AutoMod rule config skipped guild=%s rule=%s errors=%s", guild_id, row.id, " | ".join(config_errors[:4]))
+                    continue
+                rules.append(_rule_definition(row))
+                snapshots.append(AutoModRuleSnapshot(id=row.id, name=row.name, rule_type=row.rule_type, action=row.action, enabled=row.enabled, priority=row.priority, channel_ids=tuple(row.channel_ids or []), role_ids=tuple(row.role_ids or []), config=config))
+            whitelist = tuple(dict(list_type=row.list_type, entry_type=row.entry_type, value=row.value) for row in entries_rows if row.list_type == "whitelist")
+            blacklist = tuple(dict(list_type=row.list_type, entry_type=row.entry_type, value=row.value) for row in entries_rows if row.list_type == "blacklist")
+            automod_config = dict((settings.config or {}).get("automod", {}))
+            blacklist_action = str(automod_config.get("blacklist_action", "delete"))
+            value = (True, blacklist_action, tuple(rules), whitelist, blacklist, tuple(snapshots))
+            self._cache[guild_id] = (time.monotonic(), *value)
+            return value
+
+    async def evaluate(self, message: discord.Message) -> tuple[Any, list[AutoModRuleSnapshot]]:
+        enabled, blacklist_action, rules, whitelist, blacklist, snapshots = await self._load_cache(message.guild.id)
+        if not enabled or not rules:
+            return None, []
         role_ids = {role.id for role in getattr(message.author, "roles", [])}
         created_at = message.author.created_at
         joined_at = message.author.joined_at if isinstance(message.author, discord.Member) else None
@@ -117,21 +177,10 @@ class AutoModCog(commands.Cog):
             author_age_seconds=max(int((now - created_at).total_seconds()), 0) if created_at else None,
             member_age_seconds=max(int((now - joined_at).total_seconds()), 0) if joined_at else None,
         )
-        context = await collect_activity(context)
-        rules = []
-        valid_rule_rows = []
-        for row in rule_rows:
-            config_errors = validate_rule_config(row.rule_type, dict(row.config or {}))
-            if config_errors:
-                logger.error("invalid AutoMod rule config skipped guild=%s rule=%s errors=%s", message.guild.id, row.id, " | ".join(config_errors[:4]))
-                continue
-            rules.append(_rule_definition(row))
-            valid_rule_rows.append(row)
-        rule_rows = valid_rule_rows
-        whitelist = [dict(list_type=row.list_type, entry_type=row.entry_type, value=row.value) for row in entries_rows if row.list_type == "whitelist"]
-        blacklist = [dict(list_type=row.list_type, entry_type=row.entry_type, value=row.value) for row in entries_rows if row.list_type == "blacklist"]
-        automod_config = dict((settings.config or {}).get("automod", {}))
-        return evaluate_rules(rules, context, whitelist, blacklist, str(automod_config.get("blacklist_action", "delete"))), rule_rows
+        if any(rule.rule_type in ACTIVITY_RULE_TYPES for rule in rules):
+            context = await collect_activity(context)
+        evaluation = evaluate_rules(rules, context, list(whitelist), list(blacklist), blacklist_action)
+        return evaluation, list(snapshots)
 
     async def on_message_event(self, message: discord.Message) -> bool:
         if message.guild is None or message.author.bot:
@@ -217,6 +266,7 @@ class AutoModCog(commands.Cog):
                 settings.automod_enabled = True
                 settings.updated_at = utc_now()
             await session.commit()
+        await self.invalidate_cache(interaction.guild.id)
         await self.audit(interaction.guild.id, interaction.user.id, "automod.enable", "settings", None, {"enabled": True})
         page = embed("BN / AUTOMOD", "A proteção automática está em operação.", "security")
         page.add_field(name="Estado", value=status_line("AutoMod", "ativo", "active"), inline=False)
@@ -235,6 +285,7 @@ class AutoModCog(commands.Cog):
             settings.automod_enabled = False
             settings.updated_at = utc_now()
             await session.commit()
+        await self.invalidate_cache(interaction.guild.id)
         await self.audit(interaction.guild.id, interaction.user.id, "automod.disable", "settings", {"enabled": True}, {"enabled": False})
         page = embed("BN / AUTOMOD", "A proteção automática foi pausada.", "security")
         page.add_field(name="Estado", value=status_line("AutoMod", "desativado", "closed"), inline=False)
@@ -267,6 +318,7 @@ class AutoModCog(commands.Cog):
                 session.add(AutoModRule(guild_id=interaction.guild.id, name=definition["name"], rule_type=definition["rule_type"], action=definition["action"], enabled=True, priority=definition["priority"], channel_ids=[], role_ids=[], config=definition["config"], created_at=utc_now(), updated_at=utc_now()))
                 created += 1
             await session.commit()
+        await self.invalidate_cache(interaction.guild.id)
         await self.audit(interaction.guild.id, interaction.user.id, "automod.setup", "rules", None, {"created": created})
         page = embed("BN / AUTOMOD PRONTO", "O perfil inicial foi aplicado sem apagar regras existentes.", "security")
         page.add_field(name="Regras novas", value=f"`{created}`", inline=True)
@@ -322,6 +374,7 @@ class AutoModCog(commands.Cog):
                 await session.flush()
                 rule_id = row.id
                 await session.commit()
+                await self.invalidate_cache(interaction.guild.id)
             except IntegrityError:
                 await session.rollback()
                 await respond(interaction, "A regra não pôde ser criada porque já existe uma regra com esse nome.", ephemeral=True)
@@ -381,6 +434,7 @@ class AutoModCog(commands.Cog):
                 row.enabled = enabled
             row.updated_at = utc_now()
             await session.commit()
+            await self.invalidate_cache(interaction.guild.id)
             snapshot = {"action": row.action, "enabled": row.enabled, "priority": row.priority, "channels": row.channel_ids, "roles": row.role_ids, "config": row.config}
         await self.audit(interaction.guild.id, interaction.user.id, "automod.rule_update", f"rule:{rule_id}", None, snapshot)
         page = embed("BN / REGRA ATUALIZADA", f"A regra `#{rule_id}` foi salva.", "security")
@@ -402,6 +456,7 @@ class AutoModCog(commands.Cog):
             name = row.name
             await session.delete(row)
             await session.commit()
+        await self.invalidate_cache(interaction.guild.id)
         await self.audit(interaction.guild.id, interaction.user.id, "automod.rule_delete", f"rule:{rule_id}")
         page = embed("BN / REGRA REMOVIDA", f"**{name}** deixou de fazer parte do AutoMod.", "security")
         page.add_field(name="ID", value=f"`{rule_id}`", inline=False)
@@ -446,6 +501,7 @@ class AutoModCog(commands.Cog):
                 settings.config = config
                 settings.updated_at = utc_now()
             await session.commit()
+        await self.invalidate_cache(interaction.guild.id)
         await self.audit(interaction.guild.id, interaction.user.id, "automod.blacklist_action", "settings", None, {"action": action})
         page = embed("BN / BLACKLIST", "A ação padrão foi alterada.", "security")
         page.add_field(name="Quando corresponder", value=f"`{action}`", inline=True)
@@ -478,6 +534,7 @@ class AutoModCog(commands.Cog):
             session.add(AutoModListEntry(guild_id=interaction.guild.id, list_type=list_type, entry_type=entry_type, value=value, reason=reason[:500] if reason else None, created_at=utc_now(), updated_at=utc_now()))
             try:
                 await session.commit()
+                await self.invalidate_cache(interaction.guild.id)
             except IntegrityError:
                 await session.rollback()
                 await respond(interaction, "Essa entrada já existe.", ephemeral=True)
@@ -530,6 +587,7 @@ class AutoModCog(commands.Cog):
                 return
             await session.delete(row)
             await session.commit()
+        await self.invalidate_cache(interaction.guild.id)
         await self.audit(interaction.guild.id, interaction.user.id, "automod.list_remove", f"{list_type}:{entry_type}:{normalized}")
         page = embed("BN / LISTA LIMPA", "A entrada foi removida.", "security")
         page.add_field(name="Valor", value=f"`{normalized}`", inline=False)
@@ -560,4 +618,5 @@ def add_to_tree(bot: commands.Bot, binding: commands.Cog | None = None) -> None:
             bound = command._copy_with(parent=automod_group, binding=binding)
             automod_group.remove_command(command.name)
             automod_group.add_command(bound)
-    bot.tree.add_command(automod_group, override=True)
+    if bot.tree.get_command(automod_group.name) is None:
+        bot.tree.add_command(automod_group)

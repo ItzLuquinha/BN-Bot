@@ -1,82 +1,96 @@
 # Auditoria individual dos comandos BN Bot
 
-Foram auditados individualmente 76 handlers. A matriz verifica decorador, escopo, resposta, defer antes de I/O, proteção de permissão quando aplicável e contrato funcional definido para cada comando.
+A matriz audita individualmente todos os handlers executáveis do código, atualmente 90 comandos. A matriz verifica decorador, escopo, resposta, defer antes de I/O, proteção de permissão quando aplicável e contrato funcional definido para cada comando.
 
-| Comando | Arquivo | Params | Escopo | Permissão | Resposta | Defer | Contrato |
-|---|---|---:|---|---|---|---|---|
-| `/admin credit` | `admin.py` | 3 | guild | OK | OK | OK | OK |
-| `/admin debit` | `admin.py` | 3 | guild | OK | OK | OK | OK |
-| `/admin job-add` | `admin.py` | 4 | guild | OK | OK | OK | OK |
-| `/admin shop-add` | `admin.py` | 4 | guild | OK | OK | OK | OK |
-| `/admin timezone` | `admin.py` | 1 | guild | OK | OK | OK | OK |
-| `/antiraid configure` | `antiraid.py` | 8 | guild | OK | OK | OK | OK |
-| `/antiraid disable` | `antiraid.py` | 0 | guild | OK | OK | OK | OK |
-| `/antiraid enable` | `antiraid.py` | 0 | guild | OK | OK | OK | OK |
-| `/antiraid setup` | `antiraid.py` | 0 | guild | OK | OK | OK | OK |
-| `/antiraid status` | `antiraid.py` | 0 | guild | OK | OK | OK | OK |
-| `/antiraid unlock` | `antiraid.py` | 0 | guild | OK | OK | OK | OK |
-| `/automod disable` | `automod.py` | 0 | guild | OK | OK | OK | OK |
-| `/automod enable` | `automod.py` | 0 | guild | OK | OK | OK | OK |
-| `/automod list-action` | `automod.py` | 1 | guild | OK | OK | OK | OK |
-| `/automod list-add` | `automod.py` | 4 | guild | OK | OK | OK | OK |
-| `/automod list-remove` | `automod.py` | 3 | guild | OK | OK | OK | OK |
-| `/automod lists` | `automod.py` | 0 | guild | OK | OK | OK | OK |
-| `/automod rule-add` | `automod.py` | 7 | guild | OK | OK | OK | OK |
-| `/automod rule-delete` | `automod.py` | 1 | guild | OK | OK | OK | OK |
-| `/automod rule-update` | `automod.py` | 7 | guild | OK | OK | OK | OK |
-| `/automod rules` | `automod.py` | 0 | guild | OK | OK | OK | OK |
-| `/automod setup` | `automod.py` | 0 | guild | OK | OK | OK | OK |
-| `/automod status` | `automod.py` | 0 | guild | OK | OK | OK | OK |
-| `/avatar` | `utility.py` | 1 | DM/guild | - | OK | OK | OK |
-| `/balance` | `economy.py` | 1 | guild | - | OK | OK | OK |
-| `/ban` | `moderation.py` | 2 | guild | OK | OK | OK | OK |
-| `/bank` | `economy.py` | 0 | guild | - | OK | OK | OK |
-| `/botinfo` | `utility.py` | 0 | DM/guild | - | OK | OK | OK |
-| `/buy` | `economy.py` | 2 | guild | - | OK | OK | OK |
-| `/clearwarns` | `moderation.py` | 1 | guild | OK | OK | OK | OK |
-| `/community-config` | `community.py` | 2 | guild | OK | OK | OK | OK |
-| `/daily` | `economy.py` | 0 | guild | - | OK | OK | OK |
-| `/dashboard` | `dashboard.py` | 0 | guild | - | OK | OK | OK |
-| `/deposit` | `economy.py` | 1 | guild | - | OK | OK | OK |
-| `/giveaway cancel` | `community.py` | 1 | guild | OK | OK | OK | OK |
-| `/giveaway create` | `community.py` | 6 | guild | OK | OK | OK | OK |
-| `/giveaway end` | `community.py` | 1 | guild | OK | OK | OK | OK |
-| `/giveaway reroll` | `community.py` | 1 | guild | OK | OK | OK | OK |
-| `/help` | `utility.py` | 0 | DM/guild | - | OK | OK | OK |
-| `/inventory` | `economy.py` | 0 | guild | - | OK | OK | OK |
-| `/job` | `economy.py` | 1 | guild | - | OK | OK | OK |
-| `/jobs` | `economy.py` | 0 | guild | - | OK | OK | OK |
-| `/kick` | `moderation.py` | 2 | guild | OK | OK | OK | OK |
-| `/leaderboard` | `progression.py` | 1 | guild | - | OK | OK | OK |
-| `/pay` | `economy.py` | 2 | guild | - | OK | OK | OK |
-| `/ping` | `utility.py` | 0 | DM/guild | - | OK | OK | OK |
-| `/poll create` | `community.py` | 12 | guild | OK | OK | OK | OK |
-| `/poll end` | `community.py` | 1 | guild | OK | OK | OK | OK |
-| `/profile` | `progression.py` | 1 | guild | - | OK | OK | OK |
-| `/purge` | `moderation.py` | 2 | guild | OK | OK | OK | OK |
-| `/remind` | `utility.py` | 3 | guild | - | OK | OK | OK |
-| `/rep` | `progression.py` | 2 | guild | - | OK | OK | OK |
-| `/report` | `community.py` | 3 | guild | - | OK | OK | OK |
-| `/report-status` | `community.py` | 3 | guild | OK | OK | OK | OK |
-| `/reps` | `progression.py` | 1 | guild | - | OK | OK | OK |
-| `/sell` | `economy.py` | 2 | guild | - | OK | OK | OK |
-| `/serverinfo` | `utility.py` | 0 | guild | - | OK | OK | OK |
-| `/shop` | `economy.py` | 0 | guild | - | OK | OK | OK |
-| `/suggest` | `community.py` | 1 | guild | - | OK | OK | OK |
-| `/suggestion-status` | `community.py` | 3 | guild | OK | OK | OK | OK |
-| `/testall` | `utility.py` | 0 | guild | OK | OK | OK | OK |
-| `/ticket` | `community.py` | 3 | guild | - | OK | OK | OK |
-| `/ticket-claim` | `community.py` | 1 | guild | OK | OK | OK | OK |
-| `/ticket-close` | `community.py` | 1 | guild | OK | OK | OK | OK |
-| `/ticket-config` | `community.py` | 3 | guild | OK | OK | OK | OK |
-| `/ticket-reopen` | `community.py` | 1 | guild | OK | OK | OK | OK |
-| `/timeout` | `moderation.py` | 3 | guild | OK | OK | OK | OK |
-| `/unban` | `moderation.py` | 1 | guild | OK | OK | OK | OK |
-| `/unwarn` | `moderation.py` | 1 | guild | OK | OK | OK | OK |
-| `/uptime` | `utility.py` | 0 | DM/guild | - | OK | OK | OK |
-| `/userinfo` | `utility.py` | 1 | guild | - | OK | OK | OK |
-| `/warn` | `moderation.py` | 2 | guild | OK | OK | OK | OK |
-| `/warns` | `moderation.py` | 1 | guild | OK | OK | OK | OK |
-| `/weekly` | `economy.py` | 0 | guild | - | OK | OK | OK |
-| `/withdraw` | `economy.py` | 1 | guild | - | OK | OK | OK |
-| `/work` | `economy.py` | 0 | guild | - | OK | OK | OK |
+| Comando | Arquivo | Params | Escopo | Permissão |
+|---|---|---:|---|---|
+| `/admin credit` | `admin.py` | 3 | guild | OK |
+| `/admin debit` | `admin.py` | 3 | guild | OK |
+| `/admin job-add` | `admin.py` | 3 | guild | OK |
+| `/admin job-remove` | `admin.py` | 1 | guild | OK |
+| `/admin rewards` | `admin.py` | 4 | guild | OK |
+| `/admin shop-add` | `admin.py` | 10 | guild | OK |
+| `/admin timezone` | `admin.py` | 1 | guild | OK |
+| `/antiraid configure` | `antiraid.py` | 8 | guild | OK |
+| `/antiraid disable` | `antiraid.py` | 0 | guild | OK |
+| `/antiraid enable` | `antiraid.py` | 0 | guild | OK |
+| `/antiraid setup` | `antiraid.py` | 0 | guild | OK |
+| `/antiraid status` | `antiraid.py` | 0 | guild | OK |
+| `/antiraid unlock` | `antiraid.py` | 0 | guild | OK |
+| `/automod disable` | `automod.py` | 0 | guild | OK |
+| `/automod enable` | `automod.py` | 0 | guild | OK |
+| `/automod list-action` | `automod.py` | 1 | guild | OK |
+| `/automod list-add` | `automod.py` | 4 | guild | OK |
+| `/automod list-remove` | `automod.py` | 3 | guild | OK |
+| `/automod lists` | `automod.py` | 0 | guild | OK |
+| `/automod rule-add` | `automod.py` | 7 | guild | OK |
+| `/automod rule-delete` | `automod.py` | 1 | guild | OK |
+| `/automod rule-update` | `automod.py` | 7 | guild | OK |
+| `/automod rules` | `automod.py` | 0 | guild | OK |
+| `/automod setup` | `automod.py` | 0 | guild | OK |
+| `/automod status` | `automod.py` | 0 | guild | OK |
+| `/avatar` | `utility.py` | 1 | DM/guild | - |
+| `/balance` | `economy.py` | 1 | guild | - |
+| `/ban` | `moderation.py` | 2 | guild | OK |
+| `/bank` | `economy.py` | 0 | guild | - |
+| `/botinfo` | `utility.py` | 0 | DM/guild | - |
+| `/buy` | `economy.py` | 2 | guild | - |
+| `/clearwarns` | `moderation.py` | 1 | guild | OK |
+| `/coinflip` | `fun.py` | 0 | guild | - |
+| `/community-config` | `community.py` | 2 | guild | OK |
+| `/daily` | `economy.py` | 0 | guild | - |
+| `/dashboard` | `dashboard.py` | 0 | guild | - |
+| `/deposit` | `economy.py` | 1 | guild | - |
+| `/dice` | `fun.py` | 0 | guild | - |
+| `/donate` | `utility.py` | 0 | DM/guild | - |
+| `/eightball` | `fun.py` | 1 | guild | - |
+| `/giveaway cancel` | `community.py` | 1 | guild | OK |
+| `/giveaway create` | `community.py` | 6 | guild | OK |
+| `/giveaway end` | `community.py` | 1 | guild | OK |
+| `/giveaway reroll` | `community.py` | 1 | guild | OK |
+| `/history` | `utility.py` | 2 | guild | OK |
+| `/inventory` | `economy.py` | 0 | guild | - |
+| `/job` | `economy.py` | 0 | guild | - |
+| `/jobs` | `economy.py` | 0 | guild | - |
+| `/kick` | `moderation.py` | 2 | guild | OK |
+| `/kiss` | `fun.py` | 1 | guild | - |
+| `/leaderboard` | `progression.py` | 2 | guild | - |
+| `/pay` | `economy.py` | 2 | guild | - |
+| `/ping` | `utility.py` | 0 | DM/guild | - |
+| `/poll create` | `community.py` | 12 | guild | OK |
+| `/poll end` | `community.py` | 1 | guild | OK |
+| `/praise` | `fun.py` | 0 | guild | - |
+| `/profile` | `progression.py` | 1 | guild | - |
+| `/purge` | `moderation.py` | 2 | guild | OK |
+| `/remind` | `utility.py` | 3 | guild | - |
+| `/rep` | `progression.py` | 2 | guild | - |
+| `/report` | `community.py` | 3 | guild | - |
+| `/report-status` | `community.py` | 3 | guild | - |
+| `/reps` | `progression.py` | 1 | guild | - |
+| `/rps` | `fun.py` | 0 | guild | - |
+| `/sell` | `economy.py` | 2 | guild | - |
+| `/serverinfo` | `utility.py` | 0 | guild | - |
+| `/shop` | `economy.py` | 0 | guild | - |
+| `/suggest` | `community.py` | 1 | guild | - |
+| `/suggestion-status` | `community.py` | 3 | guild | - |
+| `/t-warn` | `moderation.py` | 3 | guild | OK |
+| `/testall` | `utility.py` | 0 | guild | OK |
+| `/ticket` | `community.py` | 3 | guild | - |
+| `/ticket-claim` | `community.py` | 1 | guild | - |
+| `/ticket-close` | `community.py` | 1 | guild | - |
+| `/ticket-config` | `community.py` | 3 | guild | OK |
+| `/ticket-reopen` | `community.py` | 1 | guild | - |
+| `/timeout` | `moderation.py` | 3 | guild | OK |
+| `/transactions` | `economy.py` | 1 | guild | - |
+| `/tutorial` | `utility.py` | 0 | DM/guild | - |
+| `/unban` | `moderation.py` | 1 | guild | OK |
+| `/unmute` | `moderation.py` | 2 | guild | OK |
+| `/untimeout` | `moderation.py` | 2 | guild | OK |
+| `/unwarn` | `moderation.py` | 1 | guild | OK |
+| `/uptime` | `utility.py` | 0 | DM/guild | - |
+| `/userinfo` | `utility.py` | 1 | guild | - |
+| `/warn` | `moderation.py` | 2 | guild | OK |
+| `/warns` | `moderation.py` | 1 | guild | OK |
+| `/weekly` | `economy.py` | 0 | guild | - |
+| `/withdraw` | `economy.py` | 1 | guild | - |
+| `/work` | `economy.py` | 0 | guild | - |

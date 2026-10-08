@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import discord
+from urllib.parse import urlencode
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from discord.ext import commands
@@ -8,7 +9,7 @@ from app.config import get_settings
 from app.core.db import session_factory
 from app.core.time import utc_now
 from app.models import Guild, Member
-from app.repositories.analytics import record_message
+from app.repositories.analytics import record_command_usage, record_message
 from app.repositories.guilds import ensure_guild, ensure_user, ensure_member
 from app.services.cooldowns import check_and_set
 from app.services.levels import add_xp
@@ -26,10 +27,13 @@ class BNBot(commands.Bot):
         intents.voice_states = True
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.tree.on_error = self.on_app_command_error
+        self.tree.allowed_installs = discord.app_commands.AppInstallationType(guild=True, user=False)
+        self.tree.allowed_contexts = discord.app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False)
         self._command_sync_lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
         from app.discord.cogs.utility import UtilityCog
+        from app.discord.cogs.fun import FunCog
         from app.discord.cogs.economy import EconomyCog
         from app.discord.cogs.progression import ProgressionCog
         from app.discord.cogs.moderation import ModerationCog
@@ -41,6 +45,7 @@ class BNBot(commands.Bot):
         from app.tasks.worker import Worker
 
         await self.add_cog(UtilityCog(self))
+        await self.add_cog(FunCog(self))
         await self.add_cog(EconomyCog(self))
         await self.add_cog(ProgressionCog(self))
         await self.add_cog(ModerationCog(self))
@@ -56,6 +61,27 @@ class BNBot(commands.Bot):
         add_antiraid_to_tree(self, antiraid_cog)
         self.worker = Worker(self)
 
+    @staticmethod
+    def _is_user_installable(command: discord.app_commands.Command | discord.app_commands.Group) -> bool:
+        installs = getattr(command, "allowed_installs", None)
+        return installs is not None and bool(getattr(installs, "user", False))
+
+    async def _sync_user_installable_global_commands(self) -> None:
+        global_commands = list(self.tree.get_commands())
+        user_commands = [command for command in global_commands if self._is_user_installable(command)]
+        if not user_commands:
+            return
+        self.tree.clear_commands(guild=None)
+        try:
+            for command in user_commands:
+                self.tree.add_command(command)
+            synced = await self.tree.sync()
+            logger.info("user-installable global slash commands synchronized count=%s", len(synced))
+        finally:
+            self.tree.clear_commands(guild=None)
+            for command in global_commands:
+                self.tree.add_command(command)
+
     async def _clear_global_commands(self) -> None:
         global_commands = list(self.tree.get_commands())
         self.tree.clear_commands(guild=None)
@@ -70,32 +96,20 @@ class BNBot(commands.Bot):
         from app.services.diagnostics import _local_command_signature, _remote_command_signatures
 
         guild_object = discord.Object(id=guild_id)
+        global_commands = list(self.tree.get_commands())
+        guild_commands = [command for command in global_commands if not self._is_user_installable(command)]
         self.tree.clear_commands(guild=guild_object)
-        self.tree.copy_global_to(guild=guild_object)
-        synced = await self.tree.sync(guild=guild_object)
-        remote = await self.tree.fetch_commands(guild=guild_object)
-        local = {
-            command.qualified_name: _local_command_signature(command, self.tree)
-            for command in self.tree.walk_commands()
-            if not getattr(command, "commands", None)
-        }
-        remote_signatures = _remote_command_signatures(remote)
-        mismatch = sorted(set(local) - set(remote_signatures))
-        stale = sorted(
-            name for name in set(local) & set(remote_signatures)
-            if local[name][2] != remote_signatures[name][2]
-        )
-        if mismatch or stale:
-            logger.warning(
-                "guild slash command verification mismatch guild=%s missing=%s stale=%s retrying",
-                guild_id,
-                mismatch[:8],
-                stale[:8],
-            )
-            self.tree.clear_commands(guild=guild_object)
-            self.tree.copy_global_to(guild=guild_object)
+        self.tree.clear_commands(guild=None)
+        try:
+            for command in guild_commands:
+                self.tree.add_command(command, guild=guild_object)
             synced = await self.tree.sync(guild=guild_object)
             remote = await self.tree.fetch_commands(guild=guild_object)
+            local = {
+                command.qualified_name: _local_command_signature(command, self.tree)
+                for command in self.tree.walk_commands(guild=guild_object)
+                if not getattr(command, "commands", None)
+            }
             remote_signatures = _remote_command_signatures(remote)
             mismatch = sorted(set(local) - set(remote_signatures))
             stale = sorted(
@@ -103,16 +117,40 @@ class BNBot(commands.Bot):
                 if local[name][2] != remote_signatures[name][2]
             )
             if mismatch or stale:
-                raise RuntimeError(
-                    f"guild command synchronization mismatch: missing={mismatch[:8]} stale={stale[:8]}"
+                logger.warning(
+                    "guild slash command verification mismatch guild=%s missing=%s stale=%s retrying",
+                    guild_id,
+                    mismatch[:8],
+                    stale[:8],
                 )
-        logger.info(
-            "guild slash commands synchronized guild=%s top_level=%s executable=%s",
-            guild_id,
-            len(synced),
-            len(remote_signatures),
-        )
-        return synced
+                self.tree.clear_commands(guild=guild_object)
+                self.tree.clear_commands(guild=None)
+                for command in guild_commands:
+                    self.tree.add_command(command, guild=guild_object)
+                synced = await self.tree.sync(guild=guild_object)
+                remote = await self.tree.fetch_commands(guild=guild_object)
+                remote_signatures = _remote_command_signatures(remote)
+                mismatch = sorted(set(local) - set(remote_signatures))
+                stale = sorted(
+                    name for name in set(local) & set(remote_signatures)
+                    if local[name][2] != remote_signatures[name][2]
+                )
+                if mismatch or stale:
+                    raise RuntimeError(
+                        f"guild command synchronization mismatch: missing={mismatch[:8]} stale={stale[:8]}"
+                    )
+            logger.info(
+                "guild slash commands synchronized guild=%s top_level=%s executable=%s user_installable_excluded=%s",
+                guild_id,
+                len(synced),
+                len(remote_signatures),
+                len(global_commands) - len(guild_commands),
+            )
+            return synced
+        finally:
+            self.tree.clear_commands(guild=None)
+            for command in global_commands:
+                self.tree.add_command(command)
 
     async def _ensure_registered_guilds(self) -> None:
         if not self.guilds:
@@ -138,13 +176,46 @@ class BNBot(commands.Bot):
             return
 
         await self._clear_global_commands()
+        await self._sync_user_installable_global_commands()
         target_ids = [settings.discord_guild_id] if settings.discord_guild_id else [guild.id for guild in self.guilds]
         for guild_id in sorted(set(value for value in target_ids if value)):
             await self._sync_guild_commands(guild_id)
         self._development_guild_sync_complete = True
 
+    async def _restore_voice_sessions(self) -> None:
+        current_voice: dict[int, set[int]] = {}
+        for guild in self.guilds:
+            channels = [*guild.voice_channels, *getattr(guild, "stage_channels", [])]
+            current_voice[guild.id] = {member.id for channel in channels for member in channel.members if not member.bot}
+        try:
+            async with session_factory() as session:
+                rows = list((await session.execute(select(Member).where(Member.voice_joined_at.is_not(None)))).scalars())
+                now = utc_now()
+                for row in rows:
+                    if row.user_id in current_voice.get(row.guild_id, set()):
+                        continue
+                    joined_at = row.voice_joined_at
+                    if joined_at is not None:
+                        row.voice_seconds += max(int((now - joined_at).total_seconds()), 0)
+                        row.voice_joined_at = None
+                        row.updated_at = now
+                for guild in self.guilds:
+                    channels = [*guild.voice_channels, *getattr(guild, "stage_channels", [])]
+                    for channel in channels:
+                        for member in channel.members:
+                            if member.bot:
+                                continue
+                            row = await ensure_member(session, guild.id, member.id, member.joined_at)
+                            if row.voice_joined_at is None:
+                                row.voice_joined_at = now
+                                row.updated_at = now
+                await session.commit()
+        except SQLAlchemyError:
+            logger.exception("voice session restoration failed")
+
     async def on_ready(self) -> None:
         await self._ensure_registered_guilds()
+        await self._restore_voice_sessions()
         settings = get_settings()
         sync_flag = "_production_command_sync_complete" if settings.app_env == "production" else "_development_guild_sync_complete"
         async with self._command_sync_lock:
@@ -200,12 +271,89 @@ class BNBot(commands.Bot):
             )
             if row is not None:
                 current = utc_now()
+                if row.voice_joined_at is not None:
+                    row.voice_seconds += max(int((current - row.voice_joined_at).total_seconds()), 0)
+                    row.voice_joined_at = None
                 row.left_at = current
                 row.updated_at = current
                 await session.commit()
 
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+        if member.bot or member.guild is None:
+            return
+        joined_channel = before.channel is None and after.channel is not None
+        left_channel = before.channel is not None and after.channel is None
+        if not joined_channel and not left_channel:
+            return
+        current = utc_now()
+        try:
+            async with session_factory() as session:
+                await ensure_guild(session, member.guild.id, member.guild.name, member.guild.owner_id, member.guild.icon.url if member.guild.icon else None)
+                await ensure_user(session, member.id, member.name, member.display_name, member.display_avatar.url, member.banner.url if member.banner else None, member.bot)
+                row = await ensure_member(session, member.guild.id, member.id, member.joined_at)
+                row = await session.scalar(select(Member).where(Member.guild_id == member.guild.id, Member.user_id == member.id).with_for_update())
+                if row is None:
+                    return
+                if joined_channel:
+                    if row.voice_joined_at is None:
+                        row.voice_joined_at = current
+                elif left_channel and row.voice_joined_at is not None:
+                    row.voice_seconds += max(int((current - row.voice_joined_at).total_seconds()), 0)
+                    row.voice_joined_at = None
+                row.updated_at = current
+                await session.commit()
+        except SQLAlchemyError:
+            logger.exception("voice tracking failed guild=%s user=%s", member.guild.id, member.id)
+
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or message.guild is None:
+        if message.author.bot:
+            return
+        if message.guild is None:
+            retry_after = await check_and_set(f"bn:dm-install:{message.author.id}", 30)
+            if retry_after is not None:
+                return
+            client_id = self.application_id
+            if client_id is None:
+                try:
+                    client_id = int(get_settings().discord_client_id)
+                except (TypeError, ValueError):
+                    logger.error("cannot build install link without application id")
+                    return
+            permissions = discord.Permissions(
+                view_channel=True,
+                send_messages=True,
+                embed_links=True,
+                attach_files=True,
+                read_message_history=True,
+                manage_messages=True,
+                moderate_members=True,
+                kick_members=True,
+                ban_members=True,
+                manage_channels=True,
+                manage_roles=True,
+            )
+            server_url = "https://discord.com/oauth2/authorize?" + urlencode({
+                "client_id": str(client_id),
+                "scope": "bot applications.commands",
+                "permissions": str(permissions.value),
+                "integration_type": "0",
+            })
+            app_url = "https://discord.com/oauth2/authorize?" + urlencode({
+                "client_id": str(client_id),
+                "scope": "applications.commands",
+                "integration_type": "1",
+            })
+            view = discord.ui.View(timeout=180)
+            view.add_item(discord.ui.Button(label="Adicionar ao servidor", style=discord.ButtonStyle.link, url=server_url))
+            view.add_item(discord.ui.Button(label="Adicionar como App", style=discord.ButtonStyle.link, url=app_url))
+            card = discord.Embed(
+                title="BN Bot · Instalação",
+                description="Quer levar o BN Bot para o seu servidor? Use o botão abaixo.\n\nVocê também pode instalar o BN Bot diretamente na sua conta para usar os comandos compatíveis com App Install.",
+                color=0x24272B,
+            )
+            if self.user is not None:
+                card.set_thumbnail(url=self.user.display_avatar.url)
+            await message.channel.send(embed=card, view=view, allowed_mentions=discord.AllowedMentions.none())
             return
         automod = self.get_cog("AutoModCog")
         if automod is not None:
@@ -227,8 +375,37 @@ class BNBot(commands.Bot):
             logger.exception("message persistence failed guild=%s user=%s", message.guild.id, message.author.id)
         await self.process_commands(message)
 
+    async def on_app_command_completion(self, interaction: discord.Interaction, command: discord.app_commands.Command) -> None:
+        try:
+            async with session_factory() as session:
+                await record_command_usage(
+                    session,
+                    interaction.user.id,
+                    interaction.guild.id if interaction.guild else None,
+                    interaction.channel_id,
+                    command.qualified_name,
+                    True,
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            logger.exception("command usage persistence failed command=%s user=%s", command.qualified_name, interaction.user.id)
+
     async def on_app_command_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError) -> None:
         original = error.original if isinstance(error, discord.app_commands.CommandInvokeError) else error
+        try:
+            async with session_factory() as session:
+                await record_command_usage(
+                    session,
+                    interaction.user.id,
+                    interaction.guild.id if interaction.guild else None,
+                    interaction.channel_id,
+                    interaction.command.qualified_name if interaction.command else "unknown",
+                    False,
+                    type(original).__name__,
+                )
+                await session.commit()
+        except SQLAlchemyError:
+            logger.exception("failed command usage persistence command=%s user=%s", interaction.command.qualified_name if interaction.command else "unknown", interaction.user.id)
         if isinstance(original, discord.app_commands.errors.MissingPermissions):
             message = "Você não possui a permissão necessária para executar este comando."
         elif isinstance(original, discord.Forbidden):

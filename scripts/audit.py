@@ -2,11 +2,19 @@ from pathlib import Path
 import ast
 
 ROOT = Path(__file__).parents[1]
+SKIP_DIRS = {".git", ".venv", "venv", "site-packages", "__pycache__", ".pytest_cache"}
+SKIP_FILES = {".env", ".env.local", ".env.development", ".env.test", ".env.production"}
+
+
+def should_skip(path: Path) -> bool:
+    return path.name in SKIP_FILES or any(part in SKIP_DIRS for part in path.parts)
 
 
 def python_audit() -> list[str]:
     errors = []
     for path in ROOT.rglob("*.py"):
+        if should_skip(path):
+            continue
         try:
             ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError as exc:
@@ -20,7 +28,7 @@ def python_audit() -> list[str]:
 def style_audit() -> list[str]:
     errors = []
     for path in ROOT.rglob("*"):
-        if not path.is_file():
+        if should_skip(path) or not path.is_file():
             continue
         try:
             text = path.read_text(encoding="utf-8")

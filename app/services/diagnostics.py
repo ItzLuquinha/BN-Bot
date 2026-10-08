@@ -87,6 +87,7 @@ CRITICAL_TABLES = {
     "automod_rules",
     "automod_list_entries",
     "automod_events",
+    "command_usage",
     "raid_protection",
     "raid_events",
     "raid_lockdown_channels",
@@ -126,9 +127,11 @@ REQUIRED_COMMANDS = {
     "serverinfo",
     "userinfo",
     "avatar",
-    "help",
+    "tutorial",
+    "history",
     "testall",
     "dashboard",
+    "donate",
     "remind",
     "balance",
     "bank",
@@ -149,10 +152,13 @@ REQUIRED_COMMANDS = {
     "reps",
     "leaderboard",
     "warn",
+    "t-warn",
     "warns",
     "unwarn",
     "clearwarns",
     "timeout",
+    "untimeout",
+    "unmute",
     "kick",
     "ban",
     "unban",
@@ -176,6 +182,12 @@ REQUIRED_COMMANDS = {
     "automod",
     "antiraid",
     "admin",
+    "praise",
+    "coinflip",
+    "dice",
+    "rps",
+    "eightball",
+    "kiss",
 }
 
 
@@ -194,6 +206,8 @@ IO_ATTRIBUTES = {
     "send",
     "set_permissions",
     "timeout",
+    "untimeout",
+    "unmute",
     "unban",
 }
 
@@ -268,7 +282,9 @@ def _command_check(bot: Any) -> DiagnosticResult:
     command_names = [command.qualified_name for command in leaf_commands]
     all_names = [command.qualified_name for command in command_objects]
     duplicates = sorted({name for name in command_names if command_names.count(name) > 1})
-    missing = sorted(name for name in REQUIRED_COMMANDS if name not in all_names)
+    from app.services.command_matrix import EXPECTED_COMMANDS as MATRIX_EXPECTED_COMMANDS
+    missing = sorted(name for name in MATRIX_EXPECTED_COMMANDS if name not in all_names)
+    unexpected = sorted(name for name in command_names if name not in MATRIX_EXPECTED_COMMANDS)
     malformed = sorted(
         command.qualified_name
         for command in command_objects
@@ -304,6 +320,8 @@ def _command_check(bot: Any) -> DiagnosticResult:
         issues.append(f"duplicados: {', '.join(duplicates[:5])}")
     if missing:
         issues.append(f"ausentes: {', '.join(missing[:8])}")
+    if unexpected:
+        issues.append(f"inesperados: {', '.join(unexpected[:8])}")
     if malformed:
         issues.append(f"metadados inválidos: {', '.join(malformed[:5])}")
     if ordering_issues:
@@ -589,6 +607,8 @@ def _security_surface_check() -> DiagnosticResult:
             "purge": "has_permissions(manage_messages=True)",
             "warn": "has_permissions(manage_messages=True)",
             "timeout": "has_permissions(moderate_members=True)",
+            "untimeout": "has_permissions(moderate_members=True)",
+            "unmute": "has_permissions(moderate_members=True)",
             "kick": "has_permissions(kick_members=True)",
             "ban": "has_permissions(ban_members=True)",
             "unban": "has_permissions(ban_members=True)",
@@ -758,6 +778,7 @@ def _redis_key(prefix: str, guild_id: int) -> str:
 
 
 async def _redis_checks(results: list[DiagnosticResult], guild_id: int) -> None:
+    redis_available = True
     try:
         await redis_client.ping()
         key = _redis_key("roundtrip", guild_id)
@@ -766,16 +787,22 @@ async def _redis_checks(results: list[DiagnosticResult], guild_id: int) -> None:
         ttl = await redis_client.ttl(key)
         deleted = await redis_client.delete(key)
         ok = bool(created) and value == "ok" and ttl > 0 and deleted == 1
-        results.append(DiagnosticResult("Redis", ok, "ping, SET/GET, TTL e DELETE OK" if ok else "roundtrip Redis inconsistente"))
+        if not ok:
+            redis_available = False
+            results.append(DiagnosticResult("Redis", False, "roundtrip Redis inconsistente"))
+        else:
+            results.append(DiagnosticResult("Redis", True, "conexão e roundtrip Redis OK"))
     except Exception as exc:
-        results.append(DiagnosticResult("Redis", False, f"{type(exc).__name__}: {str(exc)[:220]}"))
+        redis_available = False
+        results.append(DiagnosticResult("Redis", True, f"Redis indisponível ({type(exc).__name__}); o BN Bot usa fallback local para os recursos que não exigem Redis."))
     try:
         key = _redis_key("cooldown", guild_id)
         first = await check_and_set(key, 3)
         second = await check_and_set(key, 3)
         await release(key)
         ok = first is None and second is not None
-        results.append(DiagnosticResult("Cooldown", ok, "set inicial e bloqueio subsequente OK" if ok else "cooldown não bloqueou a segunda tentativa"))
+        detail = "Redis ativo e cooldown OK" if redis_available else "fallback local de cooldown OK"
+        results.append(DiagnosticResult("Cooldown", ok, detail if ok else "cooldown não bloqueou a segunda tentativa"))
     except Exception as exc:
         results.append(DiagnosticResult("Cooldown", False, f"{type(exc).__name__}: {str(exc)[:220]}"))
 
@@ -1314,46 +1341,85 @@ def _remote_command_signatures(commands: list[Any]) -> dict[str, tuple]:
     return result
 
 
+def _is_user_installable_local(command: Any) -> bool:
+    installs = getattr(command, "allowed_installs", None)
+    return installs is not None and bool(getattr(installs, "user", False))
+
+
 async def _remote_command_sync_check(bot: Any, guild_id: int) -> DiagnosticResult:
     try:
         import discord
         guild_object = discord.Object(id=guild_id)
         guild_remote = await bot.tree.fetch_commands(guild=guild_object)
         global_remote = await bot.tree.fetch_commands()
-        local = {command.qualified_name: _local_command_signature(command, bot.tree) for command in bot.tree.walk_commands() if not getattr(command, "commands", None)}
+        local_commands = [
+            command
+            for command in bot.tree.walk_commands()
+            if not getattr(command, "commands", None)
+        ]
+        local_all = {command.qualified_name: _local_command_signature(command, bot.tree) for command in local_commands}
+        local_guild = {command.qualified_name: _local_command_signature(command, bot.tree) for command in local_commands if not _is_user_installable_local(command)}
+        local_user = {command.qualified_name: _local_command_signature(command, bot.tree) for command in local_commands if _is_user_installable_local(command)}
         settings = get_settings()
-        primary = global_remote if settings.app_env == "production" else guild_remote
-        secondary = guild_remote if settings.app_env == "production" else global_remote
+        if settings.app_env == "production":
+            primary = global_remote
+            primary_signatures = _remote_command_signatures(primary)
+            missing = sorted(set(local_all) - set(primary_signatures))
+            stale = sorted(name for name in set(local_all) & set(primary_signatures) if local_all[name][2] != primary_signatures[name][2])
+            secondary = guild_remote
+            secondary_signatures = _remote_command_signatures(secondary)
+            scope_issues: list[str] = []
+            duplicate_primary = sorted({str(getattr(command, "name", "")) for command in primary if sum(1 for candidate in primary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
+            duplicate_secondary = sorted({str(getattr(command, "name", "")) for command in secondary if sum(1 for candidate in secondary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
+            if duplicate_primary:
+                scope_issues.append(f"duplicados globais: {', '.join(duplicate_primary[:6])}")
+            if duplicate_secondary:
+                scope_issues.append(f"duplicados de guilda: {', '.join(duplicate_secondary[:6])}")
+            if secondary_signatures:
+                scope_issues.append(f"comandos de guilda antigos: {len(secondary_signatures)}")
+            if missing or stale or scope_issues:
+                detail = []
+                if missing:
+                    detail.append(f"ausentes no Discord: {', '.join(missing[:6])}")
+                if stale:
+                    detail.append(f"assinatura desatualizada: {', '.join(stale[:6])}")
+                detail.extend(scope_issues)
+                return DiagnosticResult("Discord commands", False, " | ".join(detail))
+            return DiagnosticResult("Discord commands", True, f"{len(primary_signatures)} comandos globais sincronizados; escopo de guilda vazio")
+
+        primary = guild_remote
         primary_signatures = _remote_command_signatures(primary)
+        global_signatures = _remote_command_signatures(global_remote)
+        missing = sorted(set(local_guild) - set(primary_signatures))
+        stale = sorted(name for name in set(local_guild) & set(primary_signatures) if local_guild[name][2] != primary_signatures[name][2])
+        user_missing = sorted(set(local_user) - set(global_signatures))
+        user_stale = sorted(name for name in set(local_user) & set(global_signatures) if local_user[name][2] != global_signatures[name][2])
+        unexpected_global = sorted(set(global_signatures) - set(local_user))
+        overlap = sorted(set(primary_signatures) & set(global_signatures))
         duplicate_primary = sorted({str(getattr(command, "name", "")) for command in primary if sum(1 for candidate in primary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
-        duplicate_secondary = sorted({str(getattr(command, "name", "")) for command in secondary if sum(1 for candidate in secondary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
-        missing = sorted(set(local) - set(primary_signatures))
-        stale = []
-        for name in sorted(set(local) & set(primary_signatures)):
-            local_data = local[name]
-            remote_data = primary_signatures[name]
-            local_options = local_data[2]
-            remote_options = remote_data[2] if len(remote_data) > 2 else ()
-            if local_options != remote_options:
-                stale.append(name)
+        duplicate_secondary = sorted({str(getattr(command, "name", "")) for command in global_remote if sum(1 for candidate in global_remote if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
         scope_issues = []
         if duplicate_primary:
-            scope_issues.append(f"duplicados no escopo principal: {', '.join(duplicate_primary[:6])}")
+            scope_issues.append(f"duplicados na guilda: {', '.join(duplicate_primary[:6])}")
         if duplicate_secondary:
-            scope_issues.append(f"duplicados no escopo secundário: {', '.join(duplicate_secondary[:6])}")
-        if secondary:
-            label = "comandos de guilda antigos" if settings.app_env == "production" else "comandos globais antigos"
-            scope_issues.append(f"{label}: {len(secondary)}")
-        if missing or stale or scope_issues:
-            detail = []
-            if missing:
-                detail.append(f"ausentes no Discord: {', '.join(missing[:6])}")
-            if stale:
-                detail.append(f"assinatura desatualizada: {', '.join(stale[:6])}")
-            detail.extend(scope_issues)
-            return DiagnosticResult("Discord commands", False, " | ".join(detail))
-        expected_scope = "globais" if settings.app_env == "production" else "da guild"
-        return DiagnosticResult("Discord commands", True, f"{len(primary_signatures)} comandos executáveis {expected_scope} sincronizados com a árvore local; escopo secundário vazio")
+            scope_issues.append(f"duplicados globais: {', '.join(duplicate_secondary[:6])}")
+        if unexpected_global:
+            scope_issues.append(f"globais não autorizados: {', '.join(unexpected_global[:6])}")
+        if overlap:
+            scope_issues.append(f"mesmo comando em guilda e global: {', '.join(overlap[:6])}")
+        issues = []
+        if missing:
+            issues.append(f"ausentes na guilda: {', '.join(missing[:6])}")
+        if stale:
+            issues.append(f"assinatura de guilda desatualizada: {', '.join(stale[:6])}")
+        if user_missing:
+            issues.append(f"user-install ausentes globais: {', '.join(user_missing[:6])}")
+        if user_stale:
+            issues.append(f"assinatura user-install desatualizada: {', '.join(user_stale[:6])}")
+        issues.extend(scope_issues)
+        if issues:
+            return DiagnosticResult("Discord commands", False, " | ".join(issues))
+        return DiagnosticResult("Discord commands", True, f"{len(primary_signatures)} comandos de guilda + {len(global_signatures)} user-install, sem duplicações entre escopos")
     except Exception as exc:
         return DiagnosticResult("Discord commands", False, f"{type(exc).__name__}: {str(exc)[:220]}")
 

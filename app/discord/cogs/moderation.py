@@ -1,6 +1,5 @@
 from __future__ import annotations
 from datetime import timedelta
-from pathlib import Path
 import logging
 import secrets
 import discord
@@ -60,30 +59,65 @@ class ModerationCog(commands.Cog):
             page.add_field(name="Expira", value=discord.utils.format_dt(expires_at, "R"), inline=True)
         await respond(interaction, embed=page)
 
-    @app_commands.command(name="warn", description="Aplica um warn.")
-    @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_messages=True)
-    async def warn(self, interaction: discord.Interaction, user: discord.Member, reason: str) -> None:
-        reason = " ".join(reason.split())
-        if not reason:
-            await respond(interaction, "Informe um motivo para o warn.", ephemeral=True)
-            return
+    async def _create_warning(self, interaction: discord.Interaction, user: discord.Member, reason: str, expires_at=None, timed=False) -> None:
         target_error = self.target_error(interaction, user)
         if target_error:
             await respond(interaction, target_error, ephemeral=True)
             return
         guild = interaction.guild
         assert guild is not None
+        reason = " ".join(reason.split())
+        if not reason:
+            await respond(interaction, "Informe um motivo para o warn.", ephemeral=True)
+            return
         await defer(interaction)
         async with session_factory() as session:
-            warning_id = await add_warning(session, guild.id, user.id, interaction.user.id, reason[:500])
+            warning_id = await add_warning(session, guild.id, user.id, interaction.user.id, reason[:500], expires_at=expires_at)
             total = await count_active_warnings(session, guild.id, user.id)
-        page = embed("BN / WARN", f"{user.mention} recebeu um warn.", "moderation")
+        title = "BN / T-WARN" if timed else "BN / WARN"
+        description = f"{user.mention} recebeu um T-Warn com expiração automática." if timed else f"{user.mention} recebeu um warn permanente."
+        page = embed(title, description, "moderation")
         page.set_thumbnail(url=user.display_avatar.url)
         page.add_field(name="ID", value=f"`{warning_id}`", inline=True)
         page.add_field(name="Warns ativos", value=f"`{number(total)}`", inline=True)
+        if expires_at is not None:
+            page.add_field(name="Expira", value=discord.utils.format_dt(expires_at, "R"), inline=True)
         page.add_field(name="Motivo", value=reason[:1024], inline=False)
         await respond(interaction, embed=page)
+
+    @app_commands.command(name="warn", description="Aplica um warn permanente.")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_messages=True)
+    @app_commands.describe(user="Usuário que receberá o warn", reason="Motivo do warn")
+    async def warn(self, interaction: discord.Interaction, user: discord.Member, reason: str) -> None:
+        await self._create_warning(interaction, user, reason)
+
+    @staticmethod
+    def parse_twarn_duration(value: str) -> int:
+        import re
+        match = re.fullmatch(r"([0-9]{1,9})([smhdSMHD])", value.strip())
+        if match is None:
+            raise ValueError("A duração deve seguir o formato `30s`, `15m`, `2h` ou `7d`.")
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        seconds = amount * multiplier
+        if seconds < 1 or seconds > 365 * 86400:
+            raise ValueError("A duração do T-Warn deve ficar entre 1 segundo e 365 dias.")
+        return seconds
+
+    @app_commands.command(name="t-warn", description="Aplica um warn temporário com duração no formato 30s, 15m, 2h ou 7d.")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_messages=True)
+    @app_commands.describe(user="Usuário que receberá o T-Warn", reason="Motivo do T-Warn", duration="Duração: S segundos, M minutos, H horas ou D dias")
+    async def t_warn(self, interaction: discord.Interaction, user: discord.Member, reason: str, duration: str) -> None:
+        try:
+            seconds = self.parse_twarn_duration(duration)
+        except ValueError as exc:
+            await respond(interaction, str(exc), ephemeral=True)
+            return
+        expires_at = utc_now() + timedelta(seconds=seconds)
+        await self._create_warning(interaction, user, reason, expires_at=expires_at, timed=True)
 
     @app_commands.command(name="warns", description="Lista warns de um usuário.")
     @app_commands.guild_only()
@@ -163,6 +197,37 @@ class ModerationCog(commands.Cog):
         page.add_field(name="Motivo", value=reason[:1024] if reason else "Não informado", inline=False)
         await respond(interaction, embed=page)
 
+    async def _remove_timeout(self, interaction: discord.Interaction, user: discord.Member, kind: str, title: str, reason: str | None = None) -> None:
+        target_error = self.target_error(interaction, user)
+        if target_error:
+            await respond(interaction, target_error, ephemeral=True)
+            return
+        guild = interaction.guild
+        assert guild is not None
+        await defer(interaction)
+        clean_reason = " ".join(reason.split())[:500] if reason else None
+        await user.timeout(None, reason=clean_reason)
+        persisted = await self.persist_punishment(guild.id, user.id, interaction.user.id, kind, clean_reason)
+        page = embed(title, f"O timeout de {user.mention} foi removido.", "moderation")
+        page.set_thumbnail(url=user.display_avatar.url)
+        page.add_field(name="Usuário", value=user.mention, inline=True)
+        page.add_field(name="Registro", value=status_line("Auditoria", "salva" if persisted else "indisponível", "ok" if persisted else "warning"), inline=True)
+        await respond(interaction, embed=page)
+
+    @app_commands.command(name="untimeout", description="Remove o timeout de um usuário.")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(moderate_members=True)
+    @app_commands.describe(user="Usuário que terá o timeout removido", reason="Motivo da remoção do timeout")
+    async def untimeout(self, interaction: discord.Interaction, user: discord.Member, reason: str | None = None) -> None:
+        await self._remove_timeout(interaction, user, "untimeout", "BN / UNTIMEOUT", reason)
+
+    @app_commands.command(name="unmute", description="Remove o timeout de um usuário usando o comando unmute.")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(moderate_members=True)
+    @app_commands.describe(user="Usuário que terá o timeout removido", reason="Motivo da remoção do timeout")
+    async def unmute(self, interaction: discord.Interaction, user: discord.Member, reason: str | None = None) -> None:
+        await self._remove_timeout(interaction, user, "unmute", "BN / UNMUTE", reason)
+
     @app_commands.command(name="kick", description="Expulsa um usuário.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(kick_members=True)
@@ -188,6 +253,13 @@ class ModerationCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None
         member = guild.get_member(user.id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user.id)
+            except discord.NotFound:
+                member = None
+            except discord.HTTPException:
+                member = None
         if member is not None:
             target_error = self.target_error(interaction, member)
             if target_error:
@@ -205,12 +277,7 @@ class ModerationCog(commands.Cog):
         page.add_field(name="Registro", value=status_line("Auditoria", "salva" if persisted else "indisponível", "ok" if persisted else "warning"), inline=True)
         page.add_field(name="Decisão", value="`BAN`", inline=True)
         page.add_field(name="Motivo", value=reason[:1024] if reason else "Não informado", inline=False)
-        media_path = Path(__file__).resolve().parents[2] / "assets" / "gavel-ban.gif"
-        if media_path.exists():
-            page.set_image(url="attachment://gavel-ban.gif")
-            await respond(interaction, embed=page, file=discord.File(media_path, filename="gavel-ban.gif"))
-        else:
-            await respond(interaction, embed=page)
+        await respond(interaction, embed=page)
 
     @app_commands.command(name="unban", description="Remove o ban de um usuário pelo ID.")
     @app_commands.guild_only()

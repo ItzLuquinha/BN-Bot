@@ -11,6 +11,36 @@ from app.core.time import local_now, utc_now
 from app.models import GuildSettings, RewardClaim
 from app.repositories.economy import add_wallet
 
+DEFAULT_REWARD_CONFIG = {
+    "daily_amount": Decimal("250"),
+    "weekly_amount": Decimal("1500"),
+    "streak_bonus_percent": Decimal("5"),
+    "streak_bonus_cap_percent": Decimal("100"),
+}
+
+
+def reward_config(settings: GuildSettings | None) -> dict[str, Decimal]:
+    raw = settings.config.get("rewards", {}) if settings and isinstance(settings.config, dict) else {}
+    values = dict(DEFAULT_REWARD_CONFIG)
+    if not isinstance(raw, dict):
+        return values
+    for key in values:
+        value = raw.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = Decimal(str(value))
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0:
+            values[key] = parsed
+    values["daily_amount"] = values["daily_amount"].quantize(Decimal("0.01"))
+    values["weekly_amount"] = values["weekly_amount"].quantize(Decimal("0.01"))
+    values["streak_bonus_percent"] = min(values["streak_bonus_percent"], Decimal("100"))
+    values["streak_bonus_cap_percent"] = min(max(values["streak_bonus_cap_percent"], Decimal("0")), Decimal("1000"))
+    return values
+
+
 logger = logging.getLogger("bn_bot.rewards")
 
 def seconds_until_next_reward(kind: str, local: datetime) -> int:
@@ -24,11 +54,14 @@ def seconds_until_next_reward(kind: str, local: datetime) -> int:
     seconds = int((boundary.astimezone(timezone.utc) - local.astimezone(timezone.utc)).total_seconds())
     return max(seconds, 1)
 
-async def claim_reward(session: AsyncSession, guild_id: int, user_id: int, kind: str, base_amount: Decimal) -> tuple[Decimal, int]:
+async def claim_reward(session: AsyncSession, guild_id: int, user_id: int, kind: str, base_amount: Decimal | None = None) -> tuple[Decimal, int]:
     if kind not in {"daily", "weekly"}:
         raise ValueError("invalid reward kind")
     settings = await session.get(GuildSettings, guild_id)
     tz_name = settings.timezone if settings else "UTC"
+    configuration = reward_config(settings)
+    if base_amount is None:
+        base_amount = configuration["daily_amount" if kind == "daily" else "weekly_amount"]
     try:
         local = local_now(tz_name)
     except ZoneInfoNotFoundError:
@@ -49,7 +82,10 @@ async def claim_reward(session: AsyncSession, guild_id: int, user_id: int, kind:
     last = await session.execute(select(RewardClaim).where(RewardClaim.guild_id == guild_id, RewardClaim.user_id == user_id, RewardClaim.kind == kind).order_by(RewardClaim.claimed_at.desc()).limit(1).with_for_update())
     previous_claim = last.scalar_one_or_none()
     streak = previous_claim.streak + 1 if previous_claim and previous_claim.claim_key == previous_key else 1
-    bonus_multiplier = min(Decimal("1") + Decimal(max(streak - 1, 0)) * Decimal("0.05"), Decimal("2.0"))
+    bonus_percent = configuration["streak_bonus_percent"]
+    bonus_cap_percent = configuration["streak_bonus_cap_percent"]
+    bonus_percent = min(Decimal(max(streak - 1, 0)) * bonus_percent, bonus_cap_percent)
+    bonus_multiplier = Decimal("1") + bonus_percent / Decimal("100")
     amount = (base_amount * bonus_multiplier).quantize(Decimal("0.01"))
     try:
         async with session.begin_nested():

@@ -36,24 +36,21 @@ def test_dashboard_optional_text_inputs_use_none_for_missing_defaults() -> None:
     assert 'return discord.utils.MISSING' not in source
 
 
-def test_dashboard_command_modes_are_explicit_and_visual() -> None:
+def test_dashboard_command_modes_are_explicit_and_textual() -> None:
     source = Path("app/discord/cogs/dashboard.py").read_text(encoding="utf-8")
-    assert 'COMMAND_MODE_ICONS = {' in source
-    assert '"direct": "▶️"' in source
-    assert '"form": "📝"' in source
-    assert '"confirm": "⚠️"' in source
-    assert 'mode, mode_label = command_mode(command)' in source
+    assert 'def command_mode' in source
+    assert 'return "confirm", "Confirmação"' in source
+    assert 'return "form", "Formulário"' in source
+    assert 'return "direct", "Direto"' in source
 
 
-def test_dashboard_component_emojis_are_real_unicode_emoji_not_decorative_symbols() -> None:
+def test_dashboard_category_buttons_do_not_use_decorative_symbols() -> None:
     source = Path("app/discord/cogs/dashboard.py").read_text(encoding="utf-8")
-    safe = {"🧭", "💰", "✨", "🛡️", "💬", "🔒", "⚙️", "▶️", "📝", "⚠️", "🏠", "◀️", "✖️", "✅", "➡️"}
-    for line in source.splitlines():
-        if "emoji=" in line:
-            assert any(value in line for value in safe) or "button_emoji" in line or "COMMAND_MODE_ICONS" in line, line
+    assert 'button_emoji' not in source
+    assert 'COMMAND_MODE_ICONS' not in source
 
 
-def test_dashboard_home_distributes_seven_categories_across_valid_rows() -> None:
+def test_dashboard_home_distributes_categories_across_valid_rows() -> None:
     source = Path("app/discord/cogs/dashboard.py").read_text(encoding="utf-8")
     assert 'for index, (category, info) in enumerate(CATEGORY_INFO.items()):' in source
     assert 'row = 0 if index < 5 else 1' in source
@@ -64,7 +61,7 @@ def test_every_expected_command_has_a_passing_individual_behavior_contract() -> 
     from app.services.command_matrix import EXPECTED_COMMANDS, audit_commands, case_issues
     cases = {case.qualified_name: case for case in audit_commands()}
     assert set(cases) == EXPECTED_COMMANDS
-    assert len(cases) == 76
+    assert len(cases) == len(EXPECTED_COMMANDS)
     failures = {name: case_issues(case) for name, case in cases.items() if case_issues(case)}
     assert failures == {}
 

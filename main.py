@@ -46,12 +46,16 @@ if sys.platform == "win32":
 
 from app.config import get_settings
 from app.core.logging import configure_logging
+from app.core.migrations import upgrade_to_head
 from app.discord.bot import BNBot
 
 
 async def main() -> None:
     configure_logging()
     logger = logging.getLogger("bn_bot")
+    logger.info("running database migrations")
+    await asyncio.to_thread(upgrade_to_head)
+    logger.info("database migrations complete")
     bot = BNBot()
     logger.info("starting %s", get_settings().app_name)
     try:

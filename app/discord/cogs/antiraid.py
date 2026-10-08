@@ -366,4 +366,5 @@ def add_to_tree(bot: commands.Bot, binding: commands.Cog | None = None) -> None:
             bound = command._copy_with(parent=raid_group, binding=binding)
             raid_group.remove_command(command.name)
             raid_group.add_command(bound)
-    bot.tree.add_command(raid_group, override=True)
+    if bot.tree.get_command(raid_group.name) is None:
+        bot.tree.add_command(raid_group)

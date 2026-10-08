@@ -22,6 +22,7 @@ from app.core.security import new_state
 from app.repositories.analytics import overview
 from app.services.analytics import activity_series, top_channels
 from app.services.automod import ACTIONS, RULE_TYPES, validate_rule_config
+from app.services.community import set_ticket_status, update_report, update_suggestion
 from app.models import AuditLog, AutoModListEntry, AutoModRule, Guild, GuildSettings, Member, EconomyAccount, Experience, Reputation, Ticket, TicketEvent, Suggestion, Report, Giveaway, GiveawayEntry, Poll, PollVote
 
 settings = get_settings()
@@ -443,12 +444,12 @@ async def dashboard_suggestion_status(request: Request, guild_id: int, suggestio
     row = await session.get(Suggestion, suggestion_id)
     if row is None or row.guild_id != guild_id:
         raise HTTPException(status_code=404, detail="Suggestion not found")
-    if payload.status not in {"pending", "analysis", "approved", "rejected", "implemented"}:
-        raise HTTPException(status_code=422, detail="Invalid suggestion status")
+    actor_id = int((request.session.get("user") or {}).get("id", 0))
     before = {"status": row.status, "staff_note": row.staff_note}
-    row.status = payload.status
-    row.staff_note = payload.note
-    row.updated_at = datetime.now(timezone.utc)
+    try:
+        row = await update_suggestion(session, suggestion_id, actor_id, payload.status, payload.note, guild_id=guild_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await _dashboard_audit(request, session, guild_id, "suggestion.status_update", f"suggestion:{suggestion_id}", before, {"status": row.status, "staff_note": row.staff_note})
     await session.commit()
     return {"id": row.id, "status": row.status, "staff_note": row.staff_note}
@@ -462,13 +463,12 @@ async def dashboard_report_status(request: Request, guild_id: int, report_id: in
     row = await session.get(Report, report_id)
     if row is None or row.guild_id != guild_id:
         raise HTTPException(status_code=404, detail="Report not found")
-    if payload.status not in {"open", "investigating", "resolved", "rejected"}:
-        raise HTTPException(status_code=422, detail="Invalid report status")
+    actor_id = int((request.session.get("user") or {}).get("id", 0))
     before = {"status": row.status, "resolver_id": row.resolver_id, "resolution": row.resolution}
-    row.status = payload.status
-    row.resolver_id = int((request.session.get("user") or {}).get("id", 0))
-    row.resolution = payload.note
-    row.updated_at = datetime.now(timezone.utc)
+    try:
+        row = await update_report(session, report_id, actor_id, payload.status, payload.note, guild_id=guild_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await _dashboard_audit(request, session, guild_id, "report.status_update", f"report:{report_id}", before, {"status": row.status, "resolver_id": row.resolver_id, "resolution": row.resolution})
     await session.commit()
     return {"id": row.id, "status": row.status, "resolver_id": row.resolver_id, "resolution": row.resolution}
@@ -482,13 +482,14 @@ async def dashboard_ticket_status(request: Request, guild_id: int, ticket_id: in
     row = await session.get(Ticket, ticket_id)
     if row is None or row.guild_id != guild_id:
         raise HTTPException(status_code=404, detail="Ticket not found")
-    if payload.status not in {"open", "closed"}:
-        raise HTTPException(status_code=422, detail="Invalid ticket status")
+    actor_id = int((request.session.get("user") or {}).get("id", 0))
+    requested_status = payload.status
+    service_status = "reopened" if requested_status == "open" and row.status == "closed" else requested_status
     before = {"status": row.status, "assignee_id": row.assignee_id}
-    row.status = payload.status
-    row.assignee_id = int((request.session.get("user") or {}).get("id", 0)) if payload.status == "closed" else row.assignee_id
-    row.updated_at = datetime.now(timezone.utc)
-    session.add(TicketEvent(id=secrets.randbits(62), ticket_id=row.id, actor_id=int((request.session.get("user") or {}).get("id", 0)), event_type=payload.status, data={"source": "dashboard", "note": payload.note}, created_at=datetime.now(timezone.utc)))
+    try:
+        row = await set_ticket_status(session, ticket_id, actor_id, service_status, {"source": "dashboard", "note": payload.note})
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await _dashboard_audit(request, session, guild_id, "ticket.status_update", f"ticket:{ticket_id}", before, {"status": row.status, "assignee_id": row.assignee_id})
     await session.commit()
     return {"id": row.id, "status": row.status, "assignee_id": row.assignee_id}

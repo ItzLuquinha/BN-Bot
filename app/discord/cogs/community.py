@@ -14,8 +14,9 @@ from app.models import Experience, GuildSettings, Member, Report, Suggestion, Ti
 from app.services.community import add_poll_vote, assign_ticket, cast_suggestion_vote, create_ticket, end_giveaway, end_poll, enter_giveaway, open_items, save_ticket_transcript, set_ticket_status, update_report, update_suggestion, validate_poll_options
 from app.services.cooldowns import check_and_set
 from app.core.validation import parse_snowflake
-from app.discord.theme import embed, number, duration, user_line, bar, ledger, STATUS, percent, status_line
+from app.discord.theme import embed, number, duration, user_line, bar, ledger, percent, status_line
 
+from app.services.rate_limits import command_rate_limit
 logger = logging.getLogger("bn_bot.discord.community")
 
 TICKET_PRIORITY_CHOICES = [
@@ -469,6 +470,7 @@ class CommunityCog(commands.Cog):
                     await respond(interaction, f"Você já possui um ticket aberto: {existing_channel.mention}.", ephemeral=True)
                     return
                 await set_ticket_status(session, existing.id, interaction.user.id, "closed", {"reason": "channel_missing"})
+                await session.commit()
             cooldown = await check_and_set(f"bn:ticket:{guild.id}:{interaction.user.id}", 30)
             if cooldown is not None:
                 await respond(interaction, f"Você já abriu um ticket recentemente. Aguarde {cooldown}s.", ephemeral=True)
@@ -507,7 +509,6 @@ class CommunityCog(commands.Cog):
 
     @app_commands.command(name="ticket-close", description="Fecha um ticket e gera o transcript. Informe o ID exibido no painel.")
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_channels=True)
     async def ticket_close_command(self, interaction: discord.Interaction, ticket_id: str) -> None:
         try:
             parsed_id = parse_snowflake(ticket_id)
@@ -538,8 +539,14 @@ class CommunityCog(commands.Cog):
         if isinstance(channel, discord.TextChannel):
             lines = []
             async for message in channel.history(limit=None, oldest_first=True):
-                content = message.content.replace("\n", " ").strip()
-                lines.append(f"{message.created_at.isoformat()} | {message.author} ({message.author.id}) | {content}")
+                content = message.content.replace("\n", " ").strip() or "[sem texto]"
+                extras = []
+                if message.attachments:
+                    extras.extend(f"[anexo] {attachment.url}" for attachment in message.attachments)
+                if message.embeds:
+                    extras.append(f"[embeds] {len(message.embeds)}")
+                suffix = " | " + " | ".join(extras) if extras else ""
+                lines.append(f"{message.created_at.isoformat()} | {message.author} ({message.author.id}) | {content}{suffix}")
             transcript = "\n".join(lines)
             opener = guild.get_member(opener_id)
             if opener:
@@ -714,6 +721,7 @@ class CommunityCog(commands.Cog):
             await session.commit()
         await respond(interaction, "Configuração de tickets salva.", ephemeral=True)
 
+    @command_rate_limit("suggest", 30)
     @app_commands.command(name="suggest", description="Publica uma sugestão para votação da comunidade.")
     @app_commands.guild_only()
     async def suggest(self, interaction: discord.Interaction, content: str) -> None:
@@ -769,7 +777,7 @@ class CommunityCog(commands.Cog):
                 return
             before_up = suggestion.upvotes
             before_down = suggestion.downvotes
-            upvotes, downvotes = await cast_suggestion_vote(session, suggestion_id, interaction.user.id, value)
+            upvotes, downvotes = await cast_suggestion_vote(session, suggestion_id, interaction.user.id, value, interaction.guild_id)
             changed = (before_up, before_down) != (upvotes, downvotes)
             await session.commit()
         await self.refresh_suggestion_message(interaction.guild, suggestion_id, upvotes, downvotes)
@@ -830,6 +838,7 @@ class CommunityCog(commands.Cog):
         await self.refresh_suggestion_message(guild, row.id, row.upvotes, row.downvotes)
         await respond(interaction, f"Sugestão #{row.id} atualizada para {row.status}.", ephemeral=True)
 
+    @command_rate_limit("report", 30)
     @app_commands.command(name="report", description="Registra uma denúncia contra um membro.")
     @app_commands.guild_only()
     async def report(self, interaction: discord.Interaction, user: discord.Member, reason: str, evidence: str | None = None) -> None:
@@ -867,7 +876,7 @@ class CommunityCog(commands.Cog):
                 report_page.add_field(name="Evidências", value=row.evidence[:1024], inline=False)
             report_page.add_field(name="Estado", value=status_line("Denúncia", "aberta", "open"), inline=False)
             try:
-                await report_channel.send(embed=report_page)
+                await report_channel.send(embed=report_page, allowed_mentions=discord.AllowedMentions.none())
                 published = True
             except discord.HTTPException:
                 logger.exception("report publication failed report=%s", row.id)
@@ -905,6 +914,7 @@ class CommunityCog(commands.Cog):
 
     giveaway_group = app_commands.Group(name="giveaway", description="Gerencia sorteios de membros.")
 
+    @command_rate_limit("giveaway", 3)
     @giveaway_group.command(name="create", description="Cria um sorteio.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -960,6 +970,7 @@ class CommunityCog(commands.Cog):
         page.add_field(name="Painel", value="O botão abaixo da publicação controla a participação.", inline=False)
         await respond(interaction, embed=page, ephemeral=True)
 
+    @command_rate_limit("giveaway", 3)
     @giveaway_group.command(name="end", description="Encerra um sorteio imediatamente.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -979,6 +990,7 @@ class CommunityCog(commands.Cog):
         page.add_field(name="Status", value=status_line("Resultado", "encerrado", "closed"), inline=True)
         await interaction.followup.send(embed=page, ephemeral=True)
 
+    @command_rate_limit("giveaway", 3)
     @giveaway_group.command(name="reroll", description="Escolhe um novo vencedor para um sorteio encerrado.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -1015,6 +1027,7 @@ class CommunityCog(commands.Cog):
         page.add_field(name="Método", value="reroll", inline=True)
         await respond(interaction, embed=page)
 
+    @command_rate_limit("giveaway", 3)
     @giveaway_group.command(name="cancel", description="Cancela um sorteio ativo.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -1127,6 +1140,7 @@ class CommunityCog(commands.Cog):
 
     poll_group = app_commands.Group(name="poll", description="Gerencia enquetes.")
 
+    @command_rate_limit("poll", 3)
     @poll_group.command(name="create", description="Cria uma enquete com 2 a 10 opções.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -1218,6 +1232,7 @@ class CommunityCog(commands.Cog):
         page.add_field(name="Votação", value="Escolha uma opção no painel da enquete.", inline=False)
         await respond(interaction, embed=page, ephemeral=True)
 
+    @command_rate_limit("poll", 3)
     @poll_group.command(name="end", description="Encerra uma enquete imediatamente.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)

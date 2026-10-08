@@ -87,12 +87,14 @@ async def save_ticket_transcript(session: AsyncSession, ticket_id: int, transcri
     session.add(TicketEvent(id=entity_id(), ticket_id=ticket.id, actor_id=actor_id, event_type="transcript_saved", data={"length": len(transcript)}, created_at=now()))
 
 
-async def cast_suggestion_vote(session: AsyncSession, suggestion_id: int, user_id: int, value: int) -> tuple[int, int]:
+async def cast_suggestion_vote(session: AsyncSession, suggestion_id: int, user_id: int, value: int, guild_id: int | None = None) -> tuple[int, int]:
     if value not in {-1, 1}:
         raise ValueError("invalid suggestion vote")
     suggestion = await session.get(Suggestion, suggestion_id, with_for_update=True)
-    if suggestion is None:
+    if suggestion is None or (guild_id is not None and suggestion.guild_id != guild_id):
         raise ValueError("suggestion not found")
+    if suggestion.status not in {"pending", "analysis"}:
+        raise ValueError("suggestion voting is closed")
     existing_result = await session.execute(select(SuggestionVote).where(SuggestionVote.suggestion_id == suggestion_id, SuggestionVote.user_id == user_id).with_for_update())
     existing = existing_result.scalar_one_or_none()
     if existing is None:
@@ -128,10 +130,22 @@ async def update_suggestion(session: AsyncSession, suggestion_id: int, actor_id:
         raise ValueError("suggestion not found")
     if guild_id is not None and suggestion.guild_id != guild_id:
         raise ValueError("suggestion not found")
-    if status not in {"pending", "analysis", "approved", "rejected", "implemented"}:
+    transitions = {
+        "pending": {"pending", "analysis", "approved", "rejected"},
+        "analysis": {"analysis", "approved", "rejected", "pending"},
+        "approved": {"approved", "implemented", "analysis"},
+        "rejected": {"rejected", "pending", "analysis"},
+        "implemented": {"implemented"},
+    }
+    if status not in transitions:
         raise ValueError("invalid suggestion status")
+    if status not in transitions.get(suggestion.status, {suggestion.status}):
+        raise ValueError(f"suggestion cannot move from {suggestion.status} to {status}")
+    note = " ".join(staff_note.split())[:2000] if staff_note else None
+    if status in {"rejected", "implemented"} and not note:
+        raise ValueError("this status requires a staff note")
     suggestion.status = status
-    suggestion.staff_note = staff_note
+    suggestion.staff_note = note
     suggestion.updated_at = now()
     return suggestion
 
@@ -142,11 +156,22 @@ async def update_report(session: AsyncSession, report_id: int, resolver_id: int,
         raise ValueError("report not found")
     if guild_id is not None and report.guild_id != guild_id:
         raise ValueError("report not found")
-    if status not in {"open", "investigating", "resolved", "rejected"}:
+    transitions = {
+        "open": {"open", "investigating", "resolved", "rejected"},
+        "investigating": {"investigating", "resolved", "rejected", "open"},
+        "resolved": {"resolved"},
+        "rejected": {"rejected", "open", "investigating"},
+    }
+    if status not in transitions:
         raise ValueError("invalid report status")
+    if status not in transitions.get(report.status, {report.status}):
+        raise ValueError(f"report cannot move from {report.status} to {status}")
+    clean_resolution = " ".join(resolution.split())[:2000] if resolution else None
+    if status in {"resolved", "rejected"} and not clean_resolution:
+        raise ValueError("this status requires a resolution note")
     report.status = status
     report.resolver_id = resolver_id
-    report.resolution = resolution
+    report.resolution = clean_resolution
     report.updated_at = now()
     return report
 

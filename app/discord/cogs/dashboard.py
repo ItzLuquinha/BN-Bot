@@ -16,40 +16,49 @@ from app.core.exceptions import CooldownActive, InsufficientFunds, NotFound, Val
 from app.core.interactions import respond
 from app.core.validation import parse_snowflake
 from app.discord.theme import embed, ledger
+from app.repositories.analytics import record_command_usage
+from app.core.db import session_factory
 
+from app.services.rate_limits import command_rate_limit
 logger = logging.getLogger("bn_bot.dashboard")
 
 
 CATEGORY_INFO = {
-    "system": {"label": "Geral", "icon": "◆", "button_emoji": "🧭", "section": "system", "style": discord.ButtonStyle.secondary},
-    "economy": {"label": "Economia", "icon": "◇", "button_emoji": "💰", "section": "economy", "style": discord.ButtonStyle.success},
-    "progression": {"label": "Progressão", "icon": "✦", "button_emoji": "✨", "section": "progression", "style": discord.ButtonStyle.primary},
-    "moderation": {"label": "Moderação", "icon": "■", "button_emoji": "🛡️", "section": "moderation", "style": discord.ButtonStyle.danger},
-    "community": {"label": "Comunidade", "icon": "○", "button_emoji": "💬", "section": "community", "style": discord.ButtonStyle.primary},
-    "security": {"label": "Segurança", "icon": "!", "button_emoji": "🔒", "section": "security", "style": discord.ButtonStyle.danger},
-    "admin": {"label": "Administração", "icon": "§", "button_emoji": "⚙️", "section": "admin", "style": discord.ButtonStyle.secondary},
+    "system": {"label": "Geral", "section": "system", "style": discord.ButtonStyle.secondary},
+    "economy": {"label": "Economia", "section": "economy", "style": discord.ButtonStyle.success},
+    "progression": {"label": "Progressão", "section": "progression", "style": discord.ButtonStyle.primary},
+    "moderation": {"label": "Moderação", "section": "moderation", "style": discord.ButtonStyle.danger},
+    "community": {"label": "Comunidade", "section": "community", "style": discord.ButtonStyle.primary},
+    "security": {"label": "Segurança", "section": "security", "style": discord.ButtonStyle.danger},
+    "admin": {"label": "Administração", "section": "admin", "style": discord.ButtonStyle.secondary},
+    "fun": {"label": "Diversão", "section": "fun", "style": discord.ButtonStyle.success},
 }
 
 CATEGORY_RULES = {
-    "economy": {"balance", "bank", "deposit", "withdraw", "pay", "daily", "weekly", "shop", "buy", "sell", "inventory", "jobs", "job", "work"},
+    "economy": {"balance", "bank", "deposit", "withdraw", "pay", "daily", "weekly", "shop", "buy", "sell", "inventory", "transactions", "jobs", "job", "work"},
     "progression": {"profile", "rep", "reps", "leaderboard"},
-    "moderation": {"warn", "warns", "unwarn", "clearwarns", "timeout", "kick", "ban", "unban", "purge"},
+    "moderation": {"warn", "t-warn", "warns", "unwarn", "clearwarns", "timeout", "untimeout", "unmute", "kick", "ban", "unban", "purge"},
     "community": {"ticket", "ticket-close", "ticket-reopen", "ticket-claim", "ticket-config", "suggest", "suggestion-status", "report", "report-status", "giveaway", "poll", "community-config"},
     "security": {"automod", "antiraid"},
     "admin": {"admin"},
+    "fun": {"coinflip", "dice", "rps", "eightball", "kiss", "praise"},
 }
 
 CONFIRM_COMMANDS = {
     "ban",
     "kick",
     "timeout",
+    "untimeout",
+    "unmute",
     "purge",
     "unban",
     "clearwarns",
     "admin credit",
     "admin debit",
     "admin shop-add",
+    "admin rewards",
     "admin job-add",
+    "admin job-remove",
     "automod enable",
     "automod disable",
     "automod setup",
@@ -69,7 +78,7 @@ CONFIRM_COMMANDS = {
     "giveaway cancel",
     "poll end",
     "ticket-close",
-    "warn", "unwarn", "clearwarns",
+    "warn", "t-warn", "unwarn", "clearwarns", "untimeout", "unmute",
     "deposit", "withdraw", "pay", "buy", "sell", "daily", "weekly", "job", "work", "rep",
     "ticket", "ticket-claim", "ticket-reopen", "ticket-config",
     "suggest", "suggestion-status", "report", "report-status", "community-config",
@@ -77,12 +86,6 @@ CONFIRM_COMMANDS = {
 }
 
 
-
-COMMAND_MODE_ICONS = {
-    "direct": "▶️",
-    "form": "📝",
-    "confirm": "⚠️",
-}
 
 def command_mode(command: app_commands.Command[Any, Any, Any]) -> tuple[str, str]:
     if command.qualified_name in CONFIRM_COMMANDS:
@@ -318,7 +321,7 @@ class DashboardHomeView(DashboardView):
         super().__init__(cog, owner_id)
         for index, (category, info) in enumerate(CATEGORY_INFO.items()):
             row = 0 if index < 5 else 1
-            button = discord.ui.Button(label=info["label"], emoji=info["button_emoji"], style=info["style"], row=row, custom_id=f"bn:dashboard:{owner_id}:{category}")
+            button = discord.ui.Button(label=info["label"], style=info["style"], row=row, custom_id=f"bn:dashboard:{owner_id}:{category}")
             button.callback = self.make_category_callback(category)
             self.add_item(button)
 
@@ -335,7 +338,6 @@ class DashboardCategorySelect(discord.ui.Select):
                 label=info["label"],
                 value=category,
                 description=f"Abrir {info["label"].lower()}",
-                emoji=info["button_emoji"],
                 default=category == selected_category,
             )
             for category, info in CATEGORY_INFO.items()
@@ -360,22 +362,21 @@ class DashboardCategoryView(DashboardView):
         info = CATEGORY_INFO[category]
         for index, command in enumerate(current):
             label = f"/{command.qualified_name}"[:80]
-            mode, _ = command_mode(command)
-            button = discord.ui.Button(label=label, emoji=COMMAND_MODE_ICONS[mode], style=info["style"], row=1 + index // 5, custom_id=f"bn:dashboard:{owner_id}:run:{secrets.token_hex(6)}")
+            button = discord.ui.Button(label=label, style=info["style"], row=1 + index // 5, custom_id=f"bn:dashboard:{owner_id}:run:{secrets.token_hex(6)}")
             button.callback = self.make_command_callback(command)
             self.add_item(button)
         self.add_item(DashboardCategorySelect(cog, owner_id, category))
         nav_row = 3
-        home = discord.ui.Button(label="Início", emoji="🏠", style=discord.ButtonStyle.secondary, row=nav_row, custom_id=f"bn:dashboard:{owner_id}:home:{secrets.token_hex(4)}")
+        home = discord.ui.Button(label="Início", style=discord.ButtonStyle.secondary, row=nav_row, custom_id=f"bn:dashboard:{owner_id}:home:{secrets.token_hex(4)}")
         home.callback = self.home_callback
         self.add_item(home)
-        previous = discord.ui.Button(label="Anterior", emoji="◀️", style=discord.ButtonStyle.secondary, row=nav_row, disabled=page <= 0, custom_id=f"bn:dashboard:{owner_id}:prev:{secrets.token_hex(4)}")
+        previous = discord.ui.Button(label="Anterior", style=discord.ButtonStyle.secondary, row=nav_row, disabled=page <= 0, custom_id=f"bn:dashboard:{owner_id}:prev:{secrets.token_hex(4)}")
         previous.callback = self.previous_callback
         self.add_item(previous)
-        next_page = discord.ui.Button(label="Próxima", emoji="▶️", style=discord.ButtonStyle.secondary, row=nav_row, disabled=start + per_page >= len(commands_list), custom_id=f"bn:dashboard:{owner_id}:next:{secrets.token_hex(4)}")
+        next_page = discord.ui.Button(label="Próxima", style=discord.ButtonStyle.secondary, row=nav_row, disabled=start + per_page >= len(commands_list), custom_id=f"bn:dashboard:{owner_id}:next:{secrets.token_hex(4)}")
         next_page.callback = self.next_callback
         self.add_item(next_page)
-        close = discord.ui.Button(label="Fechar", emoji="✖️", style=discord.ButtonStyle.secondary, row=nav_row, custom_id=f"bn:dashboard:{owner_id}:close:{secrets.token_hex(4)}")
+        close = discord.ui.Button(label="Fechar", style=discord.ButtonStyle.secondary, row=nav_row, custom_id=f"bn:dashboard:{owner_id}:close:{secrets.token_hex(4)}")
         close.callback = self.close_callback
         self.add_item(close)
 
@@ -402,8 +403,8 @@ class DashboardConfirmView(DashboardView):
         super().__init__(cog, owner_id, timeout=120)
         self.command = command
         self.values = values
-        confirm = discord.ui.Button(label="Executar", emoji="✅", style=discord.ButtonStyle.danger, custom_id=f"bn:dashboard:{owner_id}:confirm:{secrets.token_hex(6)}")
-        cancel = discord.ui.Button(label="Cancelar", emoji="✖️", style=discord.ButtonStyle.secondary, custom_id=f"bn:dashboard:{owner_id}:cancel:{secrets.token_hex(6)}")
+        confirm = discord.ui.Button(label="Executar", style=discord.ButtonStyle.danger, custom_id=f"bn:dashboard:{owner_id}:confirm:{secrets.token_hex(6)}")
+        cancel = discord.ui.Button(label="Cancelar", style=discord.ButtonStyle.secondary, custom_id=f"bn:dashboard:{owner_id}:cancel:{secrets.token_hex(6)}")
         confirm.callback = self.confirm_callback
         cancel.callback = self.cancel_callback
         self.add_item(confirm)
@@ -473,6 +474,7 @@ class DashboardCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+    @command_rate_limit("dashboard", 5)
     @app_commands.command(name="dashboard", description="Abre o painel interativo de comandos do BN Bot.")
     @app_commands.guild_only()
     async def dashboard(self, interaction: discord.Interaction) -> None:
@@ -524,14 +526,14 @@ class DashboardCog(commands.Cog):
         forms = sum(1 for values in grouped.values() for command in values if command_mode(command)[0] == "form")
         confirmations = sum(1 for values in grouped.values() for command in values if command_mode(command)[0] == "confirm")
         page.add_field(name="Catálogo", value=f"`{total_commands}` comandos · `{active_categories}` áreas", inline=True)
-        page.add_field(name="Execução", value=f"▶ `{direct}` diretos\n✎ `{forms}` com formulário\n! `{confirmations}` com confirmação", inline=True)
+        page.add_field(name="Execução", value=f"`{direct}` diretos\n`{forms}` com formulário\n`{confirmations}` com confirmação", inline=True)
         page.add_field(name="Navegação", value="Entre nas áreas, percorra as páginas e abra qualquer comando sem sair do Discord.", inline=False)
         for category, info in CATEGORY_INFO.items():
             commands_list = grouped[category]
             preview = " · ".join(f"`/{command.qualified_name}`" for command in commands_list[:3]) or "nenhum"
             if len(commands_list) > 3:
                 preview += f" · +{len(commands_list) - 3}"
-            page.add_field(name=f"{info['icon']} {info['label']} · {len(commands_list)}", value=preview, inline=False)
+            page.add_field(name=f"{info['label']} · {len(commands_list)}", value=preview, inline=False)
         page.add_field(name="Como funciona", value=ledger([
             ("Escolha", "abra uma categoria"),
             ("Comando", "clique no comando desejado"),
@@ -544,10 +546,10 @@ class DashboardCog(commands.Cog):
         info = CATEGORY_INFO[category]
         per_page = 10
         page_count = max((len(commands_list) + per_page - 1) // per_page, 1)
-        page = embed(f"BN Bot · {info['icon']} {info['label']}", f"Página `{page_number + 1}/{page_count}` · escolha um comando para abrir sua execução.", info["section"])
+        page = embed(f"BN Bot · {info['label']}", f"Página `{page_number + 1}/{page_count}` · escolha um comando para abrir sua execução.", info["section"])
         if self.bot.user is not None:
             page.set_thumbnail(url=self.bot.user.display_avatar.url)
-        page.add_field(name="Legenda", value="▶ executa direto  ·  ✎ abre formulário  ·  ! pede confirmação", inline=False)
+        page.add_field(name="Legenda", value="Direto · formulário · confirmação", inline=False)
         current = commands_list[page_number * per_page:page_number * per_page + per_page]
         for index, command in enumerate(current, start=page_number * per_page + 1):
             parameters = list(getattr(command, "parameters", ()) or [])
@@ -555,8 +557,8 @@ class DashboardCog(commands.Cog):
             if len(parameters) > 6:
                 args += f" · +{len(parameters) - 6}"
             value = command.description or "Sem descrição."
-            mode, mode_label = command_mode(command)
-            value = f"{COMMAND_MODE_ICONS[mode]} {mode_label}\n{value}"
+            _, mode_label = command_mode(command)
+            value = f"{mode_label}\n{value}"
             if args:
                 value += f"\n{args}"
             page.add_field(name=f"{index:02d} · /{command.qualified_name}", value=value[:1024], inline=True)
@@ -587,7 +589,7 @@ class DashboardCog(commands.Cog):
             return
         category = command_category(command.qualified_name)
         preview = embed(f"/{command.qualified_name}", command.description or "Preencha os parâmetros para continuar.", category)
-        preview.add_field(name="Área", value=f"{CATEGORY_INFO[category]['icon']} {CATEGORY_INFO[category]['label']}", inline=True)
+        preview.add_field(name="Área", value=CATEGORY_INFO[category]["label"], inline=True)
         preview.add_field(name="Campos", value=f"`{len(parameters)}`", inline=True)
         preview.add_field(name="Execução", value="Preencha os dados abaixo para continuar.", inline=True)
         preview.add_field(name="Parâmetros", value="\n".join(f"`{parameter.name}` · {parameter_help(parameter)}" for parameter in parameters)[:1024], inline=False)
@@ -600,7 +602,7 @@ class DashboardCog(commands.Cog):
             section = command_category(command.qualified_name)
             page = embed("Confirmar ação", f"Você está prestes a executar `/{command.qualified_name}`.", section)
             page.add_field(name="Comando", value=f"`/{command.qualified_name}`", inline=True)
-            page.add_field(name="Categoria", value=f"{CATEGORY_INFO[command_category(command.qualified_name)]['icon']} {CATEGORY_INFO[command_category(command.qualified_name)]['label']}", inline=True)
+            page.add_field(name="Categoria", value=CATEGORY_INFO[command_category(command.qualified_name)]["label"], inline=True)
             if values:
                 summary = "\n".join(f"`{key}` · `{str(value)[:180]}`" for key, value in values.items())
                 page.add_field(name="Dados", value=summary[:1024], inline=False)
@@ -611,6 +613,8 @@ class DashboardCog(commands.Cog):
         await self.execute_command(interaction, command, values)
 
     async def execute_command(self, interaction: discord.Interaction, command: app_commands.Command[Any, Any, Any], values: dict[str, Any]) -> None:
+        success = False
+        error_type = None
         try:
             chain: list[Any] = []
             current = command
@@ -624,16 +628,29 @@ class DashboardCog(commands.Cog):
                         result = await result
                     if result is False:
                         raise app_commands.CheckFailure("A verificação do comando falhou.")
-            if getattr(command, "guild_only", False) and interaction.guild is None:
+            if interaction.guild is None and (getattr(command, "guild_only", False) or any("guild_only" in repr(check).casefold() for node in chain for check in getattr(node, "checks", ()) or ())):
                 raise app_commands.NoPrivateMessage()
+            parameters = list(getattr(command, "parameters", ()) or ())
+            missing = [parameter.name for parameter in parameters if getattr(parameter, "required", False) and parameter.name not in values]
+            if missing:
+                raise ValidationFailure("Preencha todos os campos obrigatórios: " + ", ".join(missing[:8]))
             callback = command.callback
             binding = getattr(command, "binding", None)
             if binding is not None:
                 await callback(binding, interaction, **values)
             else:
                 await callback(interaction, **values)
+            success = True
         except Exception as exc:
+            error_type = type(exc).__name__
             await self.send_execution_error(interaction, command, exc)
+        finally:
+            try:
+                async with session_factory() as session:
+                    await record_command_usage(session, interaction.user.id, interaction.guild.id if interaction.guild else None, interaction.channel_id, command.qualified_name, success, None if success else error_type or "DashboardExecutionError")
+                    await session.commit()
+            except SQLAlchemyError:
+                logger.exception("dashboard command usage persistence failed command=%s user=%s", command.qualified_name, interaction.user.id)
 
     async def send_execution_error(self, interaction: discord.Interaction, command: app_commands.Command[Any, Any, Any], exc: Exception) -> None:
         if isinstance(exc, app_commands.errors.MissingPermissions):
@@ -677,10 +694,10 @@ class DashboardParameterStartView(DashboardView):
         super().__init__(cog, owner_id, timeout=600)
         self.command = command
         self.parameters = parameters
-        open_modal = discord.ui.Button(label="Preencher parâmetros", emoji="➡️", style=CATEGORY_INFO[command_category(command.qualified_name)]["style"], row=0, custom_id=f"bn:dashboard:{owner_id}:params:{secrets.token_hex(6)}")
+        open_modal = discord.ui.Button(label="Preencher parâmetros", style=CATEGORY_INFO[command_category(command.qualified_name)]["style"], row=0, custom_id=f"bn:dashboard:{owner_id}:params:{secrets.token_hex(6)}")
         open_modal.callback = self.open_modal_callback
         self.add_item(open_modal)
-        back = discord.ui.Button(label="Voltar", emoji="◀️", style=discord.ButtonStyle.secondary, row=0, custom_id=f"bn:dashboard:{owner_id}:back:{secrets.token_hex(6)}")
+        back = discord.ui.Button(label="Voltar", style=discord.ButtonStyle.secondary, row=0, custom_id=f"bn:dashboard:{owner_id}:back:{secrets.token_hex(6)}")
         back.callback = self.back_callback
         self.add_item(back)
 

@@ -50,6 +50,7 @@ class Member(Base, Timestamped):
     activity_score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     message_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     voice_seconds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    voice_joined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 class EconomyAccount(Base):
     __tablename__ = "economy_accounts"
@@ -547,6 +548,23 @@ class Integration(Base, Timestamped):
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     __table_args__ = (UniqueConstraint("guild_id", "provider"),)
+
+
+class CommandUsage(Base):
+    __tablename__ = "command_usage"
+    __table_args__ = (
+        Index("ix_command_usage_guild_used", "guild_id", "used_at"),
+        Index("ix_command_usage_guild_category_used", "guild_id", "category", "used_at"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    guild_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("guilds.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    channel_id: Mapped[int | None] = mapped_column(BigInteger)
+    command_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    category: Mapped[str] = mapped_column(String(40), nullable=False)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_type: Mapped[str | None] = mapped_column(String(120))
+    used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
