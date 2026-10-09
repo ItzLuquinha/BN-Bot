@@ -20,7 +20,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Registra tanto em /api/v1/auth quanto em /auth (para compatibilidade com o Discord Portal)
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Autenticação"])
+app.include_router(auth.router, prefix="/auth", include_in_schema=False)
+
 app.include_router(guilds.router, prefix="/api/v1/guilds", tags=["Guilds & Configurações"])
 
 @app.get("/health", tags=["Status"])
