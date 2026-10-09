@@ -26,10 +26,11 @@ def test_praise_message_is_the_requested_phrase():
     assert "Obrigado por existirem." in source
 
 
-def test_database_migrations_run_before_bot_start():
+def test_database_migrations_are_checked_before_bot_start():
     source = Path("main.py").read_text(encoding="utf-8")
     assert "upgrade_to_head" in source
-    assert "await asyncio.to_thread(upgrade_to_head)" in source
+    assert "database_at_head" in source
+    assert "asyncio.wait_for(asyncio.to_thread(upgrade_to_head), timeout=35)" in source
 
 
 def test_group_registration_is_idempotent():
@@ -122,12 +123,13 @@ def test_dashboard_executor_validates_checks_and_records_failures():
     assert "error_type = type(exc).__name__" in source
 
 
-def test_testall_reports_critical_and_attention_levels():
+def test_testall_reports_severity_without_redundant_summary_fields():
     source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
     assert "diagnostic_severity" in source
     assert "CRÍTICO" in source
     assert "ATENÇÃO" in source
-    assert "Críticos:" in source
+    assert "Críticos:" not in source
+    assert 'page.add_field(name="Saúde"' not in source
 
 
 def test_user_installable_commands_are_excluded_from_guild_sync() -> None:
@@ -144,19 +146,28 @@ def test_diagnostics_flags_global_and_guild_command_overlap() -> None:
 
     source = Path("app/discord/bot.py").read_text(encoding="utf-8")
     assert 'guild_commands = [command for command in global_commands if not self._is_user_installable(command)]' in source
-    assert 'for command in guild_commands:' in source
+    assert 'guild_copies = [self._copy_command_for_guild(command) for command in guild_commands]' in source
     assert 'user_installable_excluded=' in source
-
-def test_donate_command_uses_the_requested_paypal_account() -> None:
-    source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
-    matrix = Path("app/services/command_matrix.py").read_text(encoding="utf-8")
-    analytics = Path("app/repositories/analytics.py").read_text(encoding="utf-8")
-    assert '@app_commands.command(name="donate"' in source
-    assert 'url="https://paypal.me/RianBraga"' in source
-    assert "@RianBraga" in source
-    assert '"donate"' in matrix
-    assert '"donate"' in analytics
 
 def test_twarn_uses_the_requested_gif() -> None:
     source = Path("app/discord/theme.py").read_text(encoding="utf-8")
     assert '"timed_warning": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExcW9wbTlsdTNwOWh0dzh0aXB2ODAzNnFlOTZic2ZlNW83b2p0b2J6NiZlcD12MV9naWZzX3NlYXJjaCZjdD1n/ioa0Au2SQOO9LKv9Fz/giphy.gif"' in source
+
+
+def test_testall_purge_limit_matches_slash_command_range():
+    diagnostics = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
+    moderation = Path("app/discord/cogs/moderation.py").read_text(encoding="utf-8")
+    assert '"purge": {"amount": "app_commands.Range[int, 1, 1000]"}' in diagnostics
+    assert 'amount: app_commands.Range[int, 1, 1000]' in moderation
+    assert "1 a 1000" in moderation
+
+
+def test_embed_defaults_to_minimal_output():
+    theme = Path("app/discord/theme.py").read_text(encoding="utf-8")
+    start = theme.index("def embed(")
+    end = theme.index("def money(", start)
+    block = theme[start:end]
+    assert 'show_gif: bool = False' in block
+    assert 'result.set_author(' not in block
+    assert 'result.set_footer(' not in block
+    assert 'timestamp=' not in block

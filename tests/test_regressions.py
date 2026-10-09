@@ -39,6 +39,19 @@ def test_purge_always_passes_callable_check() -> None:
     assert "check = None if user is None" not in source
 
 
+def test_purge_supports_1000_messages_and_handles_discord_failures() -> None:
+    source = Path("app/discord/cogs/moderation.py").read_text(encoding="utf-8")
+    start = source.index("async def purge(")
+    block = source[start:]
+    assert "app_commands.Range[int, 1, 1000]" in block
+    assert "bot_permissions.read_message_history" in block
+    assert "bot_permissions.view_channel" in block
+    assert "try:" in block and "channel.purge(" in block
+    assert "except discord.RateLimited" in block
+    assert "except discord.Forbidden" in block
+    assert "except discord.HTTPException" in block
+
+
 def test_poll_create_exposes_two_required_options() -> None:
     source = Path("app/discord/cogs/community.py").read_text(encoding="utf-8")
     assert "option1: str" in source
@@ -301,10 +314,11 @@ def test_interaction_scan_catches_response_edit_and_duplicate_defer() -> None:
     assert 'múltiplos defer' in source
 
 
-def test_utility_imports_all_visual_helpers_it_uses() -> None:
+def test_utility_imports_visual_helpers_it_uses() -> None:
     source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
-    assert 'status_line' in source.split('from app.discord.theme import ', 1)[1].split('\n', 1)[0]
-    assert 'bar' in source.split('from app.discord.theme import ', 1)[1].split('\n', 1)[0]
+    imports = source.split('from app.discord.theme import ', 1)[1].split('\n', 1)[0]
+    assert 'status_line' in imports
+    assert 'bar(' not in source
 
 
 
@@ -524,8 +538,8 @@ def test_antiraid_disable_retries_pending_lockdown_cleanup() -> None:
     end = source.index('async def configure', start)
     block = source[start:end]
     assert 'pending = await self.lockdown_pending_count(interaction.guild.id)' in block
-    assert 'if pending:' in block
-    assert 'row.active_until = utc_now()' in block
+    assert 'row.active_until = None' in block
+    assert 'if pending:' not in block
 
 
 def test_dashboard_rejects_corrupt_redis_session_payload() -> None:
@@ -605,12 +619,17 @@ def test_automod_kick_and_ban_are_persisted_in_moderation_history() -> None:
     assert '"kick"' in block and '"ban"' in block
 
 
-def test_embed_theme_removes_repetitive_branding_and_keeps_section_identity() -> None:
+def test_embed_theme_uses_minimal_branding_and_no_default_gif() -> None:
     source = Path("app/discord/theme.py").read_text(encoding="utf-8")
+    start = source.index("def embed(")
+    end = source.index("def money(", start)
+    block = source[start:end]
     assert "def _clean_title(title: str) -> str:" in source
     assert 'if cleaned.upper().startswith("BN /"):' in source
-    assert 'result.set_author(name=f"BN Bot  ·  {section_label.upper()}")' in source
-    assert 'result.set_footer(text=f"BN Bot · {section_label}")' in source
+    assert 'show_gif: bool = False' in block
+    assert 'result.set_author(' not in block
+    assert 'result.set_footer(' not in block
+    assert 'timestamp=discord.utils.utcnow()' not in block
 
 
 def test_tutorial_panel_does_not_show_a_fake_full_progress_bar() -> None:
@@ -656,7 +675,8 @@ def test_remote_command_signatures_flattens_all_group_children_from_payload() ->
     end = source.index("async def _remote_command_sync_check", start)
     block = source[start:end]
     assert "data = command.to_dict()" in block
-    assert "if top_type == 2:" in block
+    assert "has_subcommands = any(_enum_int(option.get(\"type\", 0)) in {1, 2} for option in options)" in block
+    assert "if has_subcommands:" in block
     assert "walk_options(options, top_name)" in block
     assert 'result[qualified] = ("1", option_name, _remote_option_signature(nested))' in block
 
@@ -666,9 +686,55 @@ def test_remote_command_parser_flattens_group_subcommands_from_exact_payload() -
     end = source.index("async def _remote_command_sync_check", start)
     block = source[start:end]
     assert "data = command.to_dict()" in block
-    assert "if top_type == 2:" in block
+    assert "has_subcommands = any(_enum_int(option.get(\"type\", 0)) in {1, 2} for option in options)" in block
+    assert "if has_subcommands:" in block
     assert "walk_options(options, top_name)" in block
     assert 'result[qualified] = ("1", option_name, _remote_option_signature(nested))' in block
+
+
+def test_remote_command_signatures_recognizes_slash_groups_with_root_type_one() -> None:
+    import ast
+    from pathlib import Path
+    from typing import Any
+
+    source = ast.parse(Path("app/services/diagnostics.py").read_text(encoding="utf-8"))
+    names = {"_enum_int", "_remote_option_signature", "_remote_command_signatures"}
+    functions = [node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    namespace = {"Any": Any}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "diagnostics_helpers.py", "exec"), namespace)
+    _remote_command_signatures = namespace["_remote_command_signatures"]
+
+    class RemoteCommand:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def to_dict(self):
+            return self.payload
+
+    commands = [
+        RemoteCommand({
+            "name": "admin", "type": 1, "options": [
+                {"name": "credit", "type": 1, "options": [
+                    {"name": "member", "type": 6, "required": True},
+                    {"name": "amount", "type": 4, "required": True},
+                ]},
+                {"name": "shop", "type": 2, "options": [
+                    {"name": "add", "type": 1, "options": [
+                        {"name": "name", "type": 3, "required": True},
+                    ]},
+                ]},
+            ],
+        }),
+        RemoteCommand({"name": "ping", "type": 1, "options": []}),
+        RemoteCommand({"name": "User Info", "type": 2, "options": []}),
+    ]
+
+    signatures = _remote_command_signatures(commands)
+    assert set(signatures) == {"admin credit", "admin shop add", "ping", "User Info"}
+    assert signatures["admin credit"][0:2] == ("1", "credit")
+    assert signatures["admin shop add"][0:2] == ("1", "add")
+    assert signatures["ping"][0:2] == ("1", "ping")
+    assert signatures["User Info"][0:2] == ("2", "User Info")
 
 
 def test_module_level_group_commands_are_bound_to_their_cog_before_tree_registration() -> None:
@@ -717,9 +783,10 @@ def test_analytics_diagnostic_counts_message_logs_with_sqlalchemy_in_clause() ->
 
 def test_discord_command_diagnostic_checks_global_and_guild_scopes() -> None:
     source = Path("app/services/diagnostics.py").read_text(encoding="utf-8")
-    assert "global_remote = await bot.tree.fetch_commands()" in source
+    assert "return await bot.tree.fetch_commands(guild=guild_object), await bot.tree.fetch_commands()" in source
     assert "mesmo comando em guilda e global" in source
-    assert "comandos de guilda antigos" in source
+    assert "user-install ausentes globais" in source
+    assert "ausentes na guilda" in source
 
 
 def test_tutorial_select_does_not_use_static_custom_id() -> None:
@@ -740,11 +807,48 @@ def test_analytics_smoke_flushes_and_uses_unique_probe_ids() -> None:
     assert "await session.flush()" in source[source.index('async def _analytics_smoke'):source.index('def _automod_smoke')]
 
 
-def test_all_command_embeds_have_contextual_public_gifs() -> None:
+def test_ping_only_shows_pong_and_latency() -> None:
+    source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
+    start = source.index('async def ping(self, interaction: discord.Interaction)')
+    end = source.index('    @user_installable', start)
+    block = source[start:end]
+    assert 'await interaction.response.send_message(f"Pong! `{latency} ms`")' in block
+    assert 'page.add_field' not in block
+    assert 'Escala de resposta' not in block
+
+
+def test_embed_theme_defaults_to_no_gif_and_keeps_optional_custom_color() -> None:
+    source = Path("app/discord/theme.py").read_text(encoding="utf-8")
+    assert "show_gif: bool = False" in source
+    assert "color_override: int | None = None" in source
+    assert "timestamp=discord.utils.utcnow()" not in source
+    assert "if show_gif:" in source
+
+
+def test_requirements_install_discord_voice_extras_for_optional_voice_support() -> None:
+    requirements = Path("requirements.txt").read_text(encoding="utf-8")
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+    assert "discord.py[voice]==2.7.1" in requirements
+    assert '"discord.py[voice]==2.7.1"' in pyproject
+
+
+def test_gifs_are_opt_in_for_command_embeds() -> None:
+    theme = Path("app/discord/theme.py").read_text(encoding="utf-8")
+    utility = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
+    assert '"progression": "https://' in theme
+    assert '"levelup": "https://' in theme
+    assert 'show_gif: bool = False' in theme
+    ping_start = utility.index('async def ping(self, interaction: discord.Interaction)')
+    ping_end = utility.index('    @user_installable', ping_start)
+    assert 'Pong! `{latency} ms`' in utility[ping_start:ping_end]
+
+
+def test_command_embeds_use_gifs_only_when_explicitly_requested() -> None:
     source = Path("app/discord/theme.py").read_text(encoding="utf-8")
     assert 'def gif_for_title(title: str, section: str = "system") -> str | None:' in source
     assert "gif_url = gif_for_title(title, section)" in source
-    assert "if gif_url:" in source
+    assert "show_gif: bool = False" in source
+    assert "if show_gif:" in source
     for key in ("system", "economy", "moderation", "community", "security", "admin", "fun", "work", "money", "shopping", "purchase", "reward", "warning", "timeout", "kick", "ban", "unban", "purge", "support", "idea", "report", "giveaway", "poll", "lockdown", "respect", "coinflip", "dice", "rps", "eightball", "reminder", "robot", "celebrate", "kiss"):
         assert f'"{key}": "https://' in source
 
@@ -918,3 +1022,44 @@ def test_project_frontend_source_has_no_comment_blocks() -> None:
                 if marker in text:
                     comments.append(f"{path}:{marker}")
     assert comments == []
+
+
+def test_rate_limit_uses_a_discord_app_command_check_error() -> None:
+    source = (Path("app") / "services" / "rate_limits.py").read_text(encoding="utf-8")
+    assert "class RateLimitExceeded(app_commands.CheckFailure)" in source
+    assert "raise RateLimitExceeded(retry_after)" in source
+
+
+def test_global_command_error_handler_covers_expected_check_failures() -> None:
+    source = (Path("app") / "discord" / "bot.py").read_text(encoding="utf-8")
+    required = (
+        "RateLimitExceeded",
+        "CommandOnCooldown",
+        "BotMissingPermissions",
+        "MissingRole",
+        "MissingAnyRole",
+        "NoPrivateMessage",
+        "CheckFailure",
+    )
+    assert all(item in source for item in required)
+
+
+def test_command_sync_signature_detects_changed_numeric_limits() -> None:
+    import ast
+    from pathlib import Path
+    from typing import Any
+
+    source = ast.parse(Path("app/services/diagnostics.py").read_text(encoding="utf-8"))
+    names = {"_enum_int", "_command_option_signature", "_remote_option_signature"}
+    functions = [node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    namespace = {"Any": Any}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "diagnostic_signature_helpers.py", "exec"), namespace)
+    local_signature = namespace["_command_option_signature"]([{
+        "name": "amount", "type": 4, "required": True, "description": "Quantidade",
+        "min_value": 1, "max_value": 1000,
+    }])
+    remote_signature = namespace["_remote_option_signature"]([{
+        "name": "amount", "type": 4, "required": True, "description": "Quantidade",
+        "min_value": 1, "max_value": 100,
+    }])
+    assert local_signature != remote_signature

@@ -21,6 +21,7 @@ class CommandAuditCase:
 
 ROOT = Path(__file__).resolve().parents[1]
 COGS = ROOT / "discord" / "cogs"
+LEGACY_COMMAND_FILES = {"bump.py"}
 
 IO_FINAL_NAMES = {
     "ban", "create_role", "create_text_channel", "delete", "edit", "fetch_channel", "fetch_message",
@@ -32,7 +33,7 @@ EXPECTED_COMMANDS = {
     "antiraid configure", "antiraid disable", "antiraid enable", "antiraid setup", "antiraid status", "antiraid unlock",
     "automod disable", "automod enable", "automod list-action", "automod list-add", "automod list-remove", "automod lists",
     "automod rule-add", "automod rule-delete", "automod rule-update", "automod rules", "automod setup", "automod status",
-    "avatar", "donate", "balance", "ban", "bank", "botinfo", "buy", "clearwarns", "community-config", "daily", "dashboard",
+    "avatar", "balance", "ban", "bank", "botinfo", "buy", "clearwarns", "community-config", "daily", "dashboard",
     "deposit", "giveaway cancel", "giveaway create", "giveaway end", "giveaway reroll", "history", "inventory", "tutorial", "job", "jobs",
     "kick", "leaderboard", "pay", "ping", "poll create", "poll end", "profile", "purge", "remind", "rep", "report",
     "report-status", "reps", "sell", "serverinfo", "shop", "suggest", "suggestion-status", "testall", "ticket",
@@ -79,7 +80,7 @@ EXPECTED_TOKENS: dict[str, tuple[str, ...]] = {
     "warns": ("list_warnings",),
     "unwarn": ("deactivate_warning",),
     "clearwarns": ("list_warnings", "row.active = False"),
-    "timeout": ("target_error", "timeout("),
+    "timeout": ("target_error", "parse_timeout_duration", "timeout("),
     "untimeout": ("self._remove_timeout",),
     "unmute": ("self._remove_timeout",),
     "kick": ("target_error", "kick("),
@@ -136,10 +137,9 @@ EXPECTED_TOKENS: dict[str, tuple[str, ...]] = {
     "avatar": ("target.display_avatar",),
     "remind": ("Reminder(", "timedelta"),
     "tutorial": ("TutorialView", "BN / TUTORIAL"),
-    "history": ("CommandUsage", "CATEGORY_LABELS", "desc(CommandUsage.used_at)"),
+    "history": ("CommandUsage", "desc(CommandUsage.used_at)", "await defer(interaction, ephemeral=True)"),
     "testall": ("run_diagnostics",),
     "dashboard": ("DashboardHomeView", "home_embed"),
-    "donate": ("paypal.me/RianBraga", "Apoiar via PayPal"),
 }
 
 
@@ -221,6 +221,8 @@ def _semantic_issues(qualified_name: str, source: str) -> list[str]:
 def audit_commands() -> list[CommandAuditCase]:
     cases: list[CommandAuditCase] = []
     for path in sorted(COGS.glob("*.py")):
+        if path.name in LEGACY_COMMAND_FILES:
+            continue
         module = ast.parse(path.read_text(encoding="utf-8"))
         groups = _group_names(module)
         source = path.read_text(encoding="utf-8")
@@ -282,7 +284,7 @@ def case_issues(case: CommandAuditCase) -> list[str]:
         issues.append("sem resposta")
     if not case.defer_before_io:
         issues.append("I/O antes de defer")
-    if not case.guild_only and case.qualified_name not in {"ping", "uptime", "botinfo", "avatar", "tutorial", "dashboard", "donate"}:
+    if not case.guild_only and case.qualified_name not in {"ping", "uptime", "botinfo", "avatar", "tutorial", "dashboard"}:
         issues.append("sem guild_only")
     if not case.semantic_ok:
         issues.append(f"contrato incompleto: {case.issue}")

@@ -19,7 +19,7 @@ from app.discord.theme import embed, ledger
 from app.repositories.analytics import record_command_usage
 from app.core.db import session_factory
 
-from app.services.rate_limits import command_rate_limit
+from app.services.rate_limits import RateLimitExceeded, command_rate_limit
 logger = logging.getLogger("bn_bot.dashboard")
 
 
@@ -478,7 +478,7 @@ class DashboardCog(commands.Cog):
     @app_commands.command(name="dashboard", description="Abre o painel interativo de comandos do BN Bot.")
     @app_commands.guild_only()
     async def dashboard(self, interaction: discord.Interaction) -> None:
-        page = self.home_embed()
+        page = self.home_embed(interaction.guild.id if interaction.guild else None)
         view = DashboardHomeView(self, interaction.user.id)
         try:
             await interaction.response.send_message(
@@ -501,18 +501,34 @@ class DashboardCog(commands.Cog):
                     ephemeral=True,
                 )
 
-    def commands_by_category(self) -> dict[str, list[app_commands.Command[Any, Any, Any]]]:
+    @staticmethod
+    def _is_user_installable(command: app_commands.Command[Any, Any, Any]) -> bool:
+        installs = getattr(command, "allowed_installs", None)
+        return installs is not None and bool(getattr(installs, "user", False))
+
+    def commands_by_category(self, guild_id: int | None = None) -> dict[str, list[app_commands.Command[Any, Any, Any]]]:
         result = {category: [] for category in CATEGORY_INFO}
-        for command in self.bot.tree.walk_commands():
+        candidates: list[app_commands.Command[Any, Any, Any]] = []
+        if guild_id is not None:
+            guild_object = discord.Object(id=guild_id)
+            candidates.extend(self.bot.tree.walk_commands(guild=guild_object))
+            candidates.extend(command for command in self.bot.tree.walk_commands() if self._is_user_installable(command))
+        else:
+            candidates.extend(self.bot.tree.walk_commands())
+        seen: set[str] = set()
+        for command in candidates:
             if getattr(command, "commands", None):
                 continue
+            if command.qualified_name in seen:
+                continue
+            seen.add(command.qualified_name)
             result[command_category(command.qualified_name)].append(command)
         for values in result.values():
             values.sort(key=lambda command: command.qualified_name)
         return result
 
-    def home_embed(self) -> discord.Embed:
-        grouped = self.commands_by_category()
+    def home_embed(self, guild_id: int | None = None) -> discord.Embed:
+        grouped = self.commands_by_category(guild_id)
         lines = [
             "Um painel visual para explorar e executar os comandos do BN Bot.",
             "Escolha uma área, abra uma página e clique no comando que você deseja usar.",
@@ -565,14 +581,14 @@ class DashboardCog(commands.Cog):
         return page
 
     async def show_home(self, interaction: discord.Interaction, owner_id: int) -> None:
-        page = self.home_embed()
+        page = self.home_embed(interaction.guild.id if interaction.guild else None)
         view = DashboardHomeView(self, owner_id)
         view.interaction = interaction
         view.message = interaction.message
         await interaction.response.edit_message(embed=page, view=view)
 
     async def show_category(self, interaction: discord.Interaction, owner_id: int, category: str, page_number: int) -> None:
-        grouped = self.commands_by_category()
+        grouped = self.commands_by_category(interaction.guild.id if interaction.guild else None)
         commands_list = grouped.get(category, [])
         max_page = max((len(commands_list) - 1) // 10, 0)
         page_number = min(max(page_number, 0), max_page)
@@ -663,6 +679,22 @@ class DashboardCog(commands.Cog):
             message = "O recurso solicitado não foi encontrado."
         elif isinstance(exc, app_commands.errors.TransformerError):
             message = "Um dos parâmetros informados é inválido."
+        elif isinstance(exc, RateLimitExceeded):
+            message = f"Aguarde {exc.seconds}s antes de tentar novamente."
+        elif isinstance(exc, app_commands.errors.CommandOnCooldown):
+            wait_seconds = max(1, int(exc.retry_after + 0.999))
+            message = f"Aguarde {wait_seconds}s antes de tentar novamente."
+        elif isinstance(exc, app_commands.errors.BotMissingPermissions):
+            message = "O BN Bot não possui as permissões necessárias para executar este comando."
+        elif isinstance(exc, app_commands.errors.MissingRole):
+            message = "Você não possui o cargo necessário para executar este comando."
+        elif isinstance(exc, app_commands.errors.MissingAnyRole):
+            message = "Você não possui nenhum dos cargos necessários para executar este comando."
+        elif isinstance(exc, app_commands.errors.CheckFailure):
+            message = "Você não atende aos requisitos para executar este comando."
+        elif isinstance(exc, discord.RateLimited):
+            wait_seconds = max(1, int(exc.retry_after + 0.999))
+            message = f"O Discord está limitando esta ação. Aguarde {wait_seconds}s e tente novamente."
         elif isinstance(exc, SQLAlchemyError):
             message = "O banco de dados recusou a operação. Tente novamente."
         elif isinstance(exc, CooldownActive):

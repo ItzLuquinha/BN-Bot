@@ -84,9 +84,11 @@ def test_praise_has_the_requested_fixed_members_and_gif() -> None:
     assert 'name="praise"' in source
     assert "GDnGv6JDCFAlJjYp3f" in theme
 
-def test_command_history_is_server_scoped_and_categorized() -> None:
+def test_command_history_is_server_scoped_and_compact() -> None:
     source = Path("app/discord/cogs/utility.py").read_text(encoding="utf-8")
     assert '@app_commands.command(name="history"' in source
     assert "@app_commands.checks.has_permissions(manage_guild=True)" in source
     assert "CommandUsage.guild_id == guild.id" in source
-    assert "CATEGORY_LABELS" in source
+    block = source[source.index("async def history("):source.index('    @command_rate_limit("testall", 30)')]
+    assert "CATEGORY_LABELS" not in block
+    assert "Não foi possível carregar o histórico agora." in block

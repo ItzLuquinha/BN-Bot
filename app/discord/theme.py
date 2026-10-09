@@ -4,14 +4,14 @@ from decimal import Decimal
 import discord
 
 COLORS = {
-    "system": 0x24272B,
-    "economy": 0x3D6E5C,
-    "progression": 0x625277,
-    "moderation": 0x8A554A,
-    "community": 0x3F6870,
-    "security": 0x75494A,
-    "admin": 0x7B6844,
-    "fun": 0x695A74,
+    "system": 0x26313D,
+    "economy": 0x247A62,
+    "progression": 0x6D5B98,
+    "moderation": 0xB6534B,
+    "community": 0x287987,
+    "security": 0x9D3947,
+    "admin": 0x9A7735,
+    "fun": 0x765A91,
 }
 
 SECTIONS = {
@@ -27,6 +27,8 @@ SECTIONS = {
 
 GIFS = {
     "system": "https://media.giphy.com/media/MXo6HLOu0KHcYQ7pVy/giphy.gif",
+    "progression": "https://media.giphy.com/media/26gR25WguJx0Var6w/giphy.gif",
+    "levelup": "https://media.giphy.com/media/26u4exk4zsAqPcq08/giphy.gif",
     "dashboard": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExZjBiaWR2b2I0M2ZreDZvcW05OHFtcHNreXN1amhocGVzZGpiYXFucCZlcD12MV9naWZzX3NlYXJjaCZjdD1n/8OYnFrez06yQt9zJFW/giphy.gif",
     "economy": "https://media.giphy.com/media/l0HlIvLpzz624GAUM/giphy.gif",
     "moderation": "https://media.giphy.com/media/ltoVrEYgv30GJvSDOk/giphy.gif",
@@ -41,7 +43,7 @@ GIFS = {
     "purchase": "https://media.giphy.com/media/l3vRetKo0xRr7w3pm/giphy.gif",
     "reward": "https://media.giphy.com/media/26u4exk4zsAqPcq08/giphy.gif",
     "warning": "https://media.giphy.com/media/S9NByAZebNkSJcPnHx/giphy.gif",
-    "timeout": "https://media.giphy.com/media/ltoVrEYgv30GJvSDOk/giphy.gif",
+    "timeout": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExbmo3ZDM1YTJzMzM4MTU3a21iZW8xMmg2MXpqMDNjcTNyM3l5d3FvNiZlcD12MV9naWZzX3NlYXJjaCZjdD1n/vOVFNit4dmql2N2Gm4/giphy.gif",
     "kick": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExbXRnbXJ5ZHIzOXlmeHh1ZnByb2tmNGhuZ3lpNDh6Yjh5bmVtbWlsbSZlcD12MV9naWZzX3NlYXJjaCZjdD1n/h8lX2S1NyWtLdOP5ly/giphy.gif",
     "ban": "https://media.giphy.com/media/v1.Y2lkPWVjZjA1ZTQ3enM1cGliaGp1dTJiZ3N4OTN4dTY1YTBjN2NwOGo4bXljbTI5cXV5OCZlcD12MV9naWZzX3NlYXJjaCZjdD1n/EP4afMcy8znubNpbMn/giphy.gif",
     "unban": "https://media.giphy.com/media/psfjpMeC1cEPmYQbs4/giphy.gif",
@@ -67,6 +69,8 @@ GIFS = {
 
 GIF_SOURCES = {
     "system": "GIPHY estudacom",
+    "progression": "GIPHY Jonas Blue",
+    "levelup": "GIPHY Awkwafina",
     "dashboard": "GIPHY user selected",
     "economy": "GIPHY Originals",
     "moderation": "GIPHY News",
@@ -156,26 +160,33 @@ def gif_for_title(title: str, section: str = "system") -> str | None:
     )
     for phrases, key in ordered_rules:
         if any(phrase in cleaned for phrase in phrases):
-            if key in {"progression", "levelup"}:
-                return None
+            if key == "progression":
+                return GIFS["progression"]
+            if key == "levelup":
+                return GIFS["levelup"]
             return GIFS[key]
     if section == "progression":
-        return None
+        return GIFS["progression"]
     return GIFS.get(section, GIFS["system"])
 
 
-def embed(title: str, description: str | None = None, section: str = "system") -> discord.Embed:
-    section_label = SECTIONS.get(section, section)
+def embed(
+    title: str,
+    description: str | None = None,
+    section: str = "system",
+    *,
+    show_gif: bool = False,
+    color_override: int | None = None,
+) -> discord.Embed:
     result = discord.Embed(
         title=_clean_title(title),
         description=description,
-        color=COLORS.get(section, COLORS["system"]),
+        color=color_override if color_override is not None else COLORS.get(section, COLORS["system"]),
     )
-    result.set_author(name=f"BN Bot  ·  {section_label.upper()}")
-    result.set_footer(text=f"BN Bot · {section_label}")
-    gif_url = gif_for_title(title, section)
-    if gif_url:
-        result.set_image(url=gif_url)
+    if show_gif:
+        gif_url = gif_for_title(title, section)
+        if gif_url:
+            result.set_image(url=gif_url)
     return result
 
 

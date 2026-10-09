@@ -93,3 +93,16 @@ def test_dashboard_ephemeral_component_edits_use_edit_original_response() -> Non
     assert "await interaction.edit_original_response(view=self)" in source
     assert "await interaction.message.edit(view=self)" not in source
     assert "await interaction.message.edit(view=None)" not in source
+
+
+def test_dashboard_error_handler_covers_expected_check_failures() -> None:
+    source = Path("app/discord/cogs/dashboard.py").read_text(encoding="utf-8")
+    required = (
+        "RateLimitExceeded",
+        "CommandOnCooldown",
+        "BotMissingPermissions",
+        "MissingRole",
+        "MissingAnyRole",
+        "CheckFailure",
+    )
+    assert all(item in source for item in required)

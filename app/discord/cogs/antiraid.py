@@ -6,7 +6,7 @@ from typing import Any
 import discord
 from discord import app_commands
 from discord.ext import commands
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from app.core.db import session_factory
 from app.core.interactions import defer, respond
 from app.core.time import utc_now
@@ -47,29 +47,78 @@ class AntiRaidCog(commands.Cog):
             for channel in channels:
                 if channel is None or channel.id in existing_ids or not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
                     continue
+                overwrite = channel.overwrites_for(guild.default_role)
+                allow, deny = overwrite.pair()
+                row = RaidLockdownChannel(
+                    id=secrets.randbits(62),
+                    guild_id=guild.id,
+                    channel_id=channel.id,
+                    had_overwrite=not overwrite.is_empty(),
+                    allow_bits=allow.value,
+                    deny_bits=deny.value,
+                    locked_at=utc_now(),
+                )
+                session.add(row)
+                await session.commit()
                 try:
-                    overwrite = channel.overwrites_for(guild.default_role)
-                    allow, deny = overwrite.pair()
                     locked = discord.PermissionOverwrite.from_pair(allow, deny)
                     locked.send_messages = False
                     locked.create_public_threads = False
                     locked.create_private_threads = False
                     locked.send_messages_in_threads = False
                     await channel.set_permissions(guild.default_role, overwrite=locked, reason="BN Bot Anti-Raid lockdown")
-                    session.add(RaidLockdownChannel(id=secrets.randbits(62), guild_id=guild.id, channel_id=channel.id, had_overwrite=not overwrite.is_empty(), allow_bits=allow.value, deny_bits=deny.value, locked_at=utc_now()))
                     changed.append(channel.id)
+                    existing_ids.add(channel.id)
                 except discord.Forbidden:
+                    await session.delete(row)
+                    await session.commit()
                     logger.warning("antiraid lockdown forbidden channel=%s guild=%s", getattr(channel, "id", None), guild.id)
-                except discord.HTTPException:
-                    logger.exception("antiraid lockdown failed channel=%s guild=%s", getattr(channel, "id", None), guild.id)
-            await session.commit()
+                except discord.RateLimited as exc:
+                    await session.delete(row)
+                    await session.commit()
+                    logger.warning(
+                        "antiraid lockdown paused by Discord rate limit guild=%s channel=%s retry_after=%s",
+                        guild.id,
+                        getattr(channel, "id", None),
+                        getattr(exc, "retry_after", "unknown"),
+                    )
+                    break
+                except discord.HTTPException as exc:
+                    if exc.status == 429:
+                        await session.delete(row)
+                        await session.commit()
+                        logger.warning("antiraid lockdown paused by Discord HTTP 429 guild=%s channel=%s", guild.id, getattr(channel, "id", None))
+                    else:
+                        logger.exception("antiraid lockdown failed channel=%s guild=%s status=%s; restore record retained", getattr(channel, "id", None), guild.id, exc.status)
+                    if exc.status == 429:
+                        break
             return changed
 
+    @staticmethod
+    def _defer_restore(row: RaidLockdownChannel, error: Exception, retry_after: float | None = None) -> None:
+        now = utc_now()
+        row.restore_attempt_count = int(row.restore_attempt_count or 0) + 1
+        if isinstance(error, discord.Forbidden):
+            delay_seconds = 6 * 3600
+        else:
+            exponential_delay = min(30 * (2 ** min(row.restore_attempt_count - 1, 10)), 86400)
+            delay_seconds = max(exponential_delay, int((retry_after or 0) + 0.999))
+        row.next_restore_attempt_at = now + timedelta(seconds=delay_seconds)
+        row.restore_last_error = f"{type(error).__name__}: {error}"[:500]
+
     async def remove_lockdown(self, guild: discord.Guild) -> list[int]:
+        now = utc_now()
         async with session_factory() as session:
-            rows = list((await session.execute(select(RaidLockdownChannel).where(RaidLockdownChannel.guild_id == guild.id))).scalars())
+            rows = list((await session.execute(
+                select(RaidLockdownChannel)
+                .where(
+                    RaidLockdownChannel.guild_id == guild.id,
+                    or_(RaidLockdownChannel.next_restore_attempt_at.is_(None), RaidLockdownChannel.next_restore_attempt_at <= now),
+                )
+                .order_by(RaidLockdownChannel.locked_at.asc())
+            )).scalars())
             restored: list[int] = []
-            for row in rows:
+            for index, row in enumerate(rows):
                 channel = guild.get_channel(row.channel_id)
                 if channel is None:
                     await session.delete(row)
@@ -82,13 +131,34 @@ class AntiRaidCog(commands.Cog):
                     else:
                         await channel.set_permissions(guild.default_role, overwrite=None, reason="BN Bot Anti-Raid lockdown expired")
                     restored.append(channel.id)
-                except discord.Forbidden:
-                    logger.warning("antiraid restore forbidden channel=%s guild=%s", getattr(channel, "id", None), guild.id)
-                    continue
-                except discord.HTTPException:
-                    logger.exception("antiraid restore failed channel=%s guild=%s", getattr(channel, "id", None), guild.id)
-                    continue
-                await session.delete(row)
+                    await session.delete(row)
+                except discord.NotFound:
+                    await session.delete(row)
+                except discord.Forbidden as exc:
+                    self._defer_restore(row, exc)
+                    logger.warning("antiraid restore deferred due to permissions channel=%s guild=%s", channel.id, guild.id)
+                except discord.RateLimited as exc:
+                    retry_after = max(float(getattr(exc, "retry_after", 1.0)), 1.0)
+                    self._defer_restore(row, exc, retry_after)
+                    for pending in rows[index + 1:]:
+                        pending.next_restore_attempt_at = utc_now() + timedelta(seconds=int(retry_after + 0.999))
+                        pending.restore_last_error = "Deferred after Discord rate limit"[:500]
+                    logger.warning("antiraid restore stopped on Discord rate limit guild=%s retry_after=%s", guild.id, retry_after)
+                    break
+                except discord.HTTPException as exc:
+                    if exc.status == 429:
+                        try:
+                            retry_after = max(float(getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After", 60)), 1.0)
+                        except (AttributeError, TypeError, ValueError):
+                            retry_after = 60.0
+                        self._defer_restore(row, exc, retry_after)
+                        for pending in rows[index + 1:]:
+                            pending.next_restore_attempt_at = utc_now() + timedelta(seconds=int(retry_after + 0.999))
+                            pending.restore_last_error = "Deferred after Discord HTTP 429"[:500]
+                        logger.warning("antiraid restore stopped on Discord HTTP 429 guild=%s retry_after=%s", guild.id, retry_after)
+                        break
+                    self._defer_restore(row, exc)
+                    logger.exception("antiraid restore deferred channel=%s guild=%s", channel.id, guild.id)
             await session.commit()
             return restored
 
@@ -221,12 +291,6 @@ class AntiRaidCog(commands.Cog):
             await session.commit()
         restored = await self.remove_lockdown(interaction.guild)
         pending = await self.lockdown_pending_count(interaction.guild.id)
-        if pending:
-            async with session_factory() as session:
-                row = await load_protection(session, interaction.guild.id)
-                row.active_until = utc_now()
-                row.updated_at = utc_now()
-                await session.commit()
         await self.audit(interaction.guild.id, interaction.user.id, "antiraid.disable", "settings", None, {"enabled": False, "restored_channels": restored, "pending_channels": pending})
         page = embed("BN / ANTI-RAID", "A proteção foi desativada e o lockdown foi revisado.", "security")
         page.add_field(name="Canais restaurados", value=f"`{number(len(restored))}`", inline=True)
@@ -336,7 +400,7 @@ class AntiRaidCog(commands.Cog):
         pending = await self.lockdown_pending_count(guild.id)
         async with session_factory() as session:
             row = await load_protection(session, guild.id)
-            row.active_until = None if pending == 0 else row.active_until
+            row.active_until = None
             row.updated_at = utc_now()
             await session.commit()
         await self.audit(guild.id, interaction.user.id, "antiraid.unlock", "lockdown", None, {"restored_channels": restored, "pending_channels": pending})
@@ -346,9 +410,25 @@ class AntiRaidCog(commands.Cog):
         await respond(interaction, embed=page)
 
     async def expire_lockdowns(self) -> None:
+        now = utc_now()
         async with session_factory() as session:
-            guild_ids = await clear_expired_state(session)
-            pending_ids = list((await session.execute(select(RaidLockdownChannel.guild_id).distinct())).scalars())
+            guild_ids = await clear_expired_state(session, now)
+            pending_ids = list((await session.execute(
+                select(RaidLockdownChannel.guild_id)
+                .outerjoin(RaidProtection, RaidProtection.guild_id == RaidLockdownChannel.guild_id)
+                .where(
+                    or_(
+                        RaidProtection.guild_id.is_(None),
+                        RaidProtection.active_until.is_(None),
+                        RaidProtection.active_until <= now,
+                    ),
+                    or_(
+                        RaidLockdownChannel.next_restore_attempt_at.is_(None),
+                        RaidLockdownChannel.next_restore_attempt_at <= now,
+                    ),
+                )
+                .distinct()
+            )).scalars())
         for guild_id in merge_lockdown_guild_ids(guild_ids, pending_ids):
             guild = self.bot.get_guild(guild_id)
             if guild is not None:

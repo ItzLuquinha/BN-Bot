@@ -1,5 +1,6 @@
 from __future__ import annotations
 from decimal import Decimal
+import logging
 import math
 import discord
 from discord import app_commands
@@ -20,6 +21,8 @@ from app.discord.theme import embed, money, number, bar, percent, ledger, compac
 
 
 from app.services.rate_limits import command_rate_limit
+
+logger = logging.getLogger("bn_bot.discord.economy")
 MAX_TRANSACTION = 1_000_000_000.0
 HIGH_VALUE_CONFIRMATION = Decimal("100000")
 

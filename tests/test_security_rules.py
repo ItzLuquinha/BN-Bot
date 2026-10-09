@@ -73,7 +73,8 @@ def test_ban_fetches_uncached_members_before_hierarchy_check() -> None:
 def test_rate_limit_falls_back_to_existing_distributed_cooldown_service() -> None:
     source = (ROOT / "app" / "services" / "rate_limits.py").read_text(encoding="utf-8")
     assert "check_and_set" in source
-    assert "CooldownActive" in source
+    assert "RateLimitExceeded" in source
+    assert "app_commands.CheckFailure" in source
     assert "guild_id = interaction.guild_id or 0" in source
 
 

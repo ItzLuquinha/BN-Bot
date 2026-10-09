@@ -12,6 +12,7 @@ from app.models import Guild, Member
 from app.repositories.analytics import record_command_usage, record_message
 from app.repositories.guilds import ensure_guild, ensure_user, ensure_member
 from app.services.cooldowns import check_and_set
+from app.services.rate_limits import RateLimitExceeded
 from app.services.levels import add_xp
 
 logger = logging.getLogger("bn_bot.discord")
@@ -30,6 +31,8 @@ class BNBot(commands.Bot):
         self.tree.allowed_installs = discord.app_commands.AppInstallationType(guild=True, user=False)
         self.tree.allowed_contexts = discord.app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False)
         self._command_sync_lock = asyncio.Lock()
+        self._synced_guild_command_ids: set[int] = set()
+        self._command_sync_retry_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def setup_hook(self) -> None:
         from app.discord.cogs.utility import UtilityCog
@@ -69,12 +72,28 @@ class BNBot(commands.Bot):
     async def _sync_user_installable_global_commands(self) -> None:
         global_commands = list(self.tree.get_commands())
         user_commands = [command for command in global_commands if self._is_user_installable(command)]
-        if not user_commands:
-            return
+        remote = await self.tree.fetch_commands()
+        from app.services.diagnostics import _local_command_signature, _remote_command_signatures
+
         self.tree.clear_commands(guild=None)
         try:
             for command in user_commands:
                 self.tree.add_command(command)
+            local = {
+                command.qualified_name: _local_command_signature(command, self.tree)
+                for command in self.tree.walk_commands()
+                if not getattr(command, "commands", None)
+            }
+            remote_signatures = _remote_command_signatures(remote)
+            remote_user_installable = all(self._is_user_installable(command) for command in remote)
+            unchanged = (
+                remote_user_installable
+                and set(local) == set(remote_signatures)
+                and all(local[name][2] == remote_signatures[name][2] for name in local)
+            )
+            if unchanged:
+                logger.info("user-installable global slash commands unchanged count=%s", len(local))
+                return
             synced = await self.tree.sync()
             logger.info("user-installable global slash commands synchronized count=%s", len(synced))
         finally:
@@ -84,6 +103,10 @@ class BNBot(commands.Bot):
 
     async def _clear_global_commands(self) -> None:
         global_commands = list(self.tree.get_commands())
+        remote = await self.tree.fetch_commands()
+        if not remote:
+            logger.info("global slash command scope is already empty")
+            return
         self.tree.clear_commands(guild=None)
         try:
             await self.tree.sync()
@@ -92,18 +115,29 @@ class BNBot(commands.Bot):
             for command in global_commands:
                 self.tree.add_command(command)
 
+    @staticmethod
+    def _copy_command_for_guild(command: discord.app_commands.Command | discord.app_commands.Group) -> discord.app_commands.Command | discord.app_commands.Group:
+        binding = getattr(command, "binding", None)
+        if isinstance(command, discord.app_commands.Group) and binding is None:
+            binding = next((getattr(child, "binding", None) for child in command.walk_commands() if getattr(child, "binding", None) is not None), None)
+        bindings = {binding: binding} if binding is not None else {}
+        clone = command._copy_with(parent=None, binding=binding, bindings=bindings)
+        for node in (clone, *clone.walk_commands()) if isinstance(clone, discord.app_commands.Group) else (clone,):
+            node.allowed_contexts = None
+            node.allowed_installs = None
+        return clone
+
     async def _sync_guild_commands(self, guild_id: int) -> list[discord.app_commands.AppCommand]:
         from app.services.diagnostics import _local_command_signature, _remote_command_signatures
 
         guild_object = discord.Object(id=guild_id)
         global_commands = list(self.tree.get_commands())
         guild_commands = [command for command in global_commands if not self._is_user_installable(command)]
+        guild_copies = [self._copy_command_for_guild(command) for command in guild_commands]
         self.tree.clear_commands(guild=guild_object)
-        self.tree.clear_commands(guild=None)
+        for command in guild_copies:
+            self.tree.add_command(command, guild=guild_object)
         try:
-            for command in guild_commands:
-                self.tree.add_command(command, guild=guild_object)
-            synced = await self.tree.sync(guild=guild_object)
             remote = await self.tree.fetch_commands(guild=guild_object)
             local = {
                 command.qualified_name: _local_command_signature(command, self.tree)
@@ -111,34 +145,39 @@ class BNBot(commands.Bot):
                 if not getattr(command, "commands", None)
             }
             remote_signatures = _remote_command_signatures(remote)
-            mismatch = sorted(set(local) - set(remote_signatures))
+            missing = sorted(set(local) - set(remote_signatures))
+            unexpected = sorted(set(remote_signatures) - set(local))
             stale = sorted(
                 name for name in set(local) & set(remote_signatures)
                 if local[name][2] != remote_signatures[name][2]
             )
-            if mismatch or stale:
-                logger.warning(
-                    "guild slash command verification mismatch guild=%s missing=%s stale=%s retrying",
+            if not (missing or unexpected or stale):
+                logger.info(
+                    "guild slash commands unchanged guild=%s executable=%s",
                     guild_id,
-                    mismatch[:8],
+                    len(local),
+                )
+                return remote
+
+            synced = await self.tree.sync(guild=guild_object)
+            remote = await self.tree.fetch_commands(guild=guild_object)
+            remote_signatures = _remote_command_signatures(remote)
+            missing = sorted(set(local) - set(remote_signatures))
+            unexpected = sorted(set(remote_signatures) - set(local))
+            stale = sorted(
+                name for name in set(local) & set(remote_signatures)
+                if local[name][2] != remote_signatures[name][2]
+            )
+            if missing or unexpected or stale:
+                logger.warning(
+                    "guild slash command verification mismatch guild=%s missing=%s stale=%s; stopping after one sync",
+                    guild_id,
+                    (missing + unexpected)[:8],
                     stale[:8],
                 )
-                self.tree.clear_commands(guild=guild_object)
-                self.tree.clear_commands(guild=None)
-                for command in guild_commands:
-                    self.tree.add_command(command, guild=guild_object)
-                synced = await self.tree.sync(guild=guild_object)
-                remote = await self.tree.fetch_commands(guild=guild_object)
-                remote_signatures = _remote_command_signatures(remote)
-                mismatch = sorted(set(local) - set(remote_signatures))
-                stale = sorted(
-                    name for name in set(local) & set(remote_signatures)
-                    if local[name][2] != remote_signatures[name][2]
+                raise RuntimeError(
+                    f"guild command synchronization mismatch: missing={(missing + unexpected)[:8]} stale={stale[:8]}"
                 )
-                if mismatch or stale:
-                    raise RuntimeError(
-                        f"guild command synchronization mismatch: missing={mismatch[:8]} stale={stale[:8]}"
-                    )
             logger.info(
                 "guild slash commands synchronized guild=%s top_level=%s executable=%s user_installable_excluded=%s",
                 guild_id,
@@ -148,9 +187,74 @@ class BNBot(commands.Bot):
             )
             return synced
         finally:
-            self.tree.clear_commands(guild=None)
+            self.tree.clear_commands(guild=guild_object)
             for command in global_commands:
-                self.tree.add_command(command)
+                if command not in self.tree.get_commands():
+                    self.tree.add_command(command)
+
+    @staticmethod
+    def _command_sync_retry_delay(error: Exception) -> float | None:
+        if isinstance(error, discord.RateLimited):
+            try:
+                return min(max(float(error.retry_after), 1.0), 900.0)
+            except (TypeError, ValueError):
+                return 60.0
+        if isinstance(error, discord.HTTPException):
+            if error.status == 429:
+                headers = getattr(getattr(error, "response", None), "headers", {})
+                try:
+                    return min(max(float(headers.get("Retry-After", 60)), 1.0), 900.0)
+                except (AttributeError, TypeError, ValueError):
+                    return 60.0
+            if error.status >= 500:
+                return 30.0
+        return None
+
+    def _schedule_command_sync_retry(self, scope: str, initial_delay: float, guild_id: int | None = None) -> None:
+        current = self._command_sync_retry_tasks.get(scope)
+        if current is not None and not current.done():
+            return
+        self._command_sync_retry_tasks[scope] = asyncio.create_task(
+            self._retry_command_sync(scope, initial_delay, guild_id)
+        )
+
+    async def _retry_command_sync(self, scope: str, initial_delay: float, guild_id: int | None) -> None:
+        delay = min(max(float(initial_delay), 1.0), 900.0)
+        try:
+            for attempt in range(5):
+                await asyncio.sleep(delay)
+                try:
+                    async with self._command_sync_lock:
+                        if guild_id is None:
+                            settings = get_settings()
+                            sync_flag = "_production_command_sync_complete" if settings.app_env == "production" else "_development_guild_sync_complete"
+                            if getattr(self, sync_flag, False):
+                                return
+                            await self._sync_command_scopes()
+                            setattr(self, sync_flag, True)
+                        else:
+                            await self._sync_guild_commands(guild_id)
+                            self._synced_guild_command_ids.add(guild_id)
+                    logger.info("slash command synchronization retry succeeded scope=%s", scope)
+                    return
+                except Exception as exc:
+                    retry_after = self._command_sync_retry_delay(exc)
+                    if retry_after is None:
+                        logger.exception("slash command synchronization retry stopped scope=%s", scope)
+                        return
+                    delay = min(max(retry_after, delay * 2), 900.0)
+                    logger.warning(
+                        "slash command synchronization retry delayed scope=%s attempt=%s/5 retry_seconds=%s error=%s",
+                        scope,
+                        attempt + 1,
+                        delay,
+                        type(exc).__name__,
+                    )
+            logger.error("slash command synchronization retries exhausted scope=%s", scope)
+        finally:
+            current = asyncio.current_task()
+            if self._command_sync_retry_tasks.get(scope) is current:
+                self._command_sync_retry_tasks.pop(scope, None)
 
     async def _ensure_registered_guilds(self) -> None:
         if not self.guilds:
@@ -166,20 +270,62 @@ class BNBot(commands.Bot):
     async def _sync_command_scopes(self) -> None:
         settings = get_settings()
         if settings.app_env == "production":
-            synced = await self.tree.sync()
-            logger.info("global slash commands synchronized count=%s environment=production", len(synced))
+            guild_errors: list[tuple[int, Exception]] = []
             for guild in self.guilds:
-                guild_object = discord.Object(id=guild.id)
-                self.tree.clear_commands(guild=guild_object)
-                await self.tree.sync(guild=guild_object)
+                if guild.id in self._synced_guild_command_ids:
+                    continue
+                try:
+                    await self._sync_guild_commands(guild.id)
+                    self._synced_guild_command_ids.add(guild.id)
+                except discord.RateLimited as exc:
+                    logger.warning("guild command synchronization paused by Discord rate limit guild=%s retry_after=%s", guild.id, getattr(exc, "retry_after", "unknown"))
+                    raise
+                except Exception as exc:
+                    if getattr(exc, "status", None) == 429:
+                        logger.warning("guild command synchronization paused by Discord HTTP 429 guild=%s", guild.id)
+                        raise
+                    guild_errors.append((guild.id, exc))
+                    logger.exception("guild slash command synchronization failed guild=%s", guild.id)
+            try:
+                await self._sync_user_installable_global_commands()
+            except (discord.HTTPException, discord.RateLimited) as exc:
+                logger.warning("user-installable global slash commands could not be synchronized status=%s detail=%s", getattr(exc, "status", "rate_limited"), str(exc)[:220])
+                raise
+            if guild_errors:
+                retryable_error = next(
+                    (error for _, error in guild_errors if self._command_sync_retry_delay(error) is not None),
+                    None,
+                )
+                if retryable_error is not None:
+                    raise retryable_error
+                raise RuntimeError(f"guild command synchronization failed for {len(guild_errors)} guilds")
             self._production_command_sync_complete = True
             return
 
-        await self._clear_global_commands()
-        await self._sync_user_installable_global_commands()
         target_ids = [settings.discord_guild_id] if settings.discord_guild_id else [guild.id for guild in self.guilds]
+        guild_errors: list[tuple[int, Exception]] = []
         for guild_id in sorted(set(value for value in target_ids if value)):
-            await self._sync_guild_commands(guild_id)
+            if guild_id in self._synced_guild_command_ids:
+                continue
+            try:
+                await self._sync_guild_commands(guild_id)
+                self._synced_guild_command_ids.add(guild_id)
+            except discord.RateLimited as exc:
+                logger.warning("guild command synchronization paused by Discord rate limit guild=%s retry_after=%s", guild_id, getattr(exc, "retry_after", "unknown"))
+                raise
+            except Exception as exc:
+                if getattr(exc, "status", None) == 429:
+                    logger.warning("guild command synchronization paused by Discord HTTP 429 guild=%s", guild_id)
+                    raise
+                guild_errors.append((guild_id, exc))
+                logger.exception("guild slash command synchronization failed guild=%s", guild_id)
+        try:
+            await self._sync_user_installable_global_commands()
+        except (discord.HTTPException, discord.RateLimited) as exc:
+            logger.warning("user-installable global slash commands could not be synchronized status=%s detail=%s", getattr(exc, "status", "rate_limited"), str(exc)[:220])
+            raise
+        if guild_errors:
+            raise RuntimeError(f"guild command synchronization failed for {len(guild_errors)} guilds")
         self._development_guild_sync_complete = True
 
     async def _restore_voice_sessions(self) -> None:
@@ -214,36 +360,63 @@ class BNBot(commands.Bot):
             logger.exception("voice session restoration failed")
 
     async def on_ready(self) -> None:
-        await self._ensure_registered_guilds()
-        await self._restore_voice_sessions()
         settings = get_settings()
         sync_flag = "_production_command_sync_complete" if settings.app_env == "production" else "_development_guild_sync_complete"
-        async with self._command_sync_lock:
-            if not getattr(self, sync_flag, False):
-                try:
-                    await self._sync_command_scopes()
-                except discord.HTTPException:
-                    logger.exception("slash command synchronization failed environment=%s", settings.app_env)
+        retry_task = self._command_sync_retry_tasks.get("all")
+        retry_pending = retry_task is not None and not retry_task.done()
+        if not getattr(self, sync_flag, False) and not retry_pending:
+            sync_error: Exception | None = None
+            async with self._command_sync_lock:
+                if not getattr(self, sync_flag, False):
+                    try:
+                        await self._sync_command_scopes()
+                        setattr(self, sync_flag, True)
+                    except Exception as exc:
+                        sync_error = exc
+                        logger.exception("slash command synchronization failed environment=%s", settings.app_env)
+            if sync_error is not None:
+                retry_after = self._command_sync_retry_delay(sync_error)
+                if retry_after is not None:
+                    self._schedule_command_sync_retry("all", retry_after)
+        try:
+            await asyncio.wait_for(self._ensure_registered_guilds(), timeout=15)
+            await asyncio.wait_for(self._restore_voice_sessions(), timeout=15)
+        except asyncio.TimeoutError:
+            logger.error("database bootstrap timed out after command synchronization")
+        except Exception:
+            logger.exception("database bootstrap after ready failed")
         logger.info("logged in as %s", self.user)
 
     async def close(self) -> None:
+        retry_tasks = list(self._command_sync_retry_tasks.values())
+        for task in retry_tasks:
+            task.cancel()
+        if retry_tasks:
+            await asyncio.gather(*retry_tasks, return_exceptions=True)
+        self._command_sync_retry_tasks.clear()
         if hasattr(self, "worker"):
             self.worker.close()
         await super().close()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
-        async with session_factory() as session:
-            await ensure_guild(session, guild.id, guild.name, guild.owner_id, guild.icon.url if guild.icon else None)
-            await session.commit()
-        settings = get_settings()
-        if settings.app_env != "production":
-            async with self._command_sync_lock:
-                try:
-                    await self._sync_guild_commands(guild.id)
-                except discord.HTTPException:
-                    logger.exception("development guild command sync failed guild=%s", guild.id)
+        try:
+            async with session_factory() as session:
+                await ensure_guild(session, guild.id, guild.name, guild.owner_id, guild.icon.url if guild.icon else None)
+                await session.commit()
+        except SQLAlchemyError:
+            logger.exception("guild join persistence failed guild=%s; continuing command setup", guild.id)
+        async with self._command_sync_lock:
+            try:
+                await self._sync_guild_commands(guild.id)
+                self._synced_guild_command_ids.add(guild.id)
+            except Exception as exc:
+                logger.exception("guild command sync failed guild=%s", guild.id)
+                retry_after = self._command_sync_retry_delay(exc)
+                if retry_after is not None:
+                    self._schedule_command_sync_retry(f"guild:{guild.id}", retry_after, guild.id)
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
+        self._synced_guild_command_ids.discard(guild.id)
         async with session_factory() as session:
             stored = await session.get(Guild, guild.id)
             if stored is not None:
@@ -416,6 +589,24 @@ class BNBot(commands.Bot):
             message = "Um dos parâmetros informados é inválido."
         elif isinstance(original, discord.app_commands.errors.CommandSignatureMismatch):
             message = "A assinatura deste comando estava desatualizada no Discord. O BN Bot está sincronizando os comandos; tente novamente em alguns segundos."
+        elif isinstance(original, RateLimitExceeded):
+            message = f"Aguarde {original.seconds}s antes de tentar novamente."
+        elif isinstance(original, discord.app_commands.errors.CommandOnCooldown):
+            wait_seconds = max(1, int(original.retry_after + 0.999))
+            message = f"Aguarde {wait_seconds}s antes de tentar novamente."
+        elif isinstance(original, discord.app_commands.errors.BotMissingPermissions):
+            message = "O BN Bot não possui as permissões necessárias para executar este comando."
+        elif isinstance(original, discord.app_commands.errors.MissingRole):
+            message = "Você não possui o cargo necessário para executar este comando."
+        elif isinstance(original, discord.app_commands.errors.MissingAnyRole):
+            message = "Você não possui nenhum dos cargos necessários para executar este comando."
+        elif isinstance(original, discord.app_commands.errors.NoPrivateMessage):
+            message = "Este comando só pode ser executado em um servidor."
+        elif isinstance(original, discord.app_commands.errors.CheckFailure):
+            message = "Você não atende aos requisitos para executar este comando."
+        elif isinstance(original, discord.RateLimited):
+            wait_seconds = max(1, int(original.retry_after + 0.999))
+            message = f"O Discord está limitando esta ação. Aguarde {wait_seconds}s e tente novamente."
         elif isinstance(original, discord.HTTPException):
             message = "O Discord recusou esta resposta. Tente o comando novamente."
         elif isinstance(original, SQLAlchemyError):

@@ -1,6 +1,20 @@
 # Commands
 
-`/balance`, `/donate`, `/bank`, `/deposit`, `/withdraw`, `/pay`, `/daily`, `/weekly`, `/shop`, `/buy`, `/sell`, `/inventory`, `/transactions`, `/jobs`, `/job`, `/work`, `/profile`, `/rep`, `/reps`, `/leaderboard`, `/warn`, `/t-warn`, `/warns`, `/unwarn`, `/clearwarns`, `/timeout`, `/untimeout`, `/unmute`, `/kick`, `/ban`, `/unban`, `/serverinfo`, `/userinfo`, `/avatar`, `/ping`, `/uptime`, `/tutorial`, `/remind`, `/dashboard`, `/history`, `/ticket`, `/ticket-close`, `/ticket-reopen`, `/ticket-claim`, `/ticket-config`, `/suggest`, `/suggestion-status`, `/report`, `/report-status`, `/community-config`.
+## Utilidades
+
+`/ping`, `/uptime`, `/botinfo`, `/serverinfo`, `/userinfo` e `/avatar` mostram informações rápidas. `/history` exibe até 50 comandos recentes e exige Manage Server.
+
+`/purge` aceita de 1 a 1000 mensagens a analisar/remover. O Discord exclui em lotes de até 100; mensagens com mais de 14 dias podem exigir exclusão individual e demorar mais.
+
+`/tutorial`, `/remind` e `/dashboard` cobrem instruções, lembretes e gerenciamento do servidor.
+
+## Economia e progressão
+
+`/balance`, `/bank`, `/deposit`, `/withdraw`, `/pay`, `/daily`, `/weekly`, `/shop`, `/buy`, `/sell`, `/inventory`, `/transactions`, `/jobs`, `/job`, `/work`, `/profile`, `/rep`, `/reps` e `/leaderboard` cobrem economia e progressão.
+
+## Moderação
+
+`/warn`, `/t-warn`, `/warns`, `/unwarn`, `/clearwarns`, `/timeout`, `/untimeout`, `/unmute`, `/kick`, `/ban`, `/unban` e `/purge` exigem as permissões correspondentes do Discord.
 
 
 ## AutoMod
@@ -43,7 +57,7 @@
 
 `/poll create` creates an interactive poll with 2 to 10 options. `/poll end` closes it immediately.
 
-`/history` mostra os últimos comandos usados, agrupados por categoria e acessível à equipe com Manage Server. `/admin job-remove` remove uma vaga com autocomplete e confirmação. `/praise` homenageia os três membros configurados pelo BN Bot.
+`/admin job-remove` remove uma vaga com autocomplete e confirmação. `/praise` homenageia os três membros configurados pelo BN Bot.
 
 
 ## Economy

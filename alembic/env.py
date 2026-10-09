@@ -41,7 +41,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = create_engine(migration_database_url(), poolclass=pool.NullPool)
+    connectable = create_engine(migration_database_url(), poolclass=pool.NullPool, connect_args={"connect_timeout": 15, "options": "-c lock_timeout=15000 -c statement_timeout=120000"})
     with connectable.connect() as connection:
         do_run_migrations(connection)
     connectable.dispose()

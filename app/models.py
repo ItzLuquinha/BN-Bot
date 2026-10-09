@@ -501,7 +501,9 @@ class RaidEvent(Base):
 
 class RaidLockdownChannel(Base):
     __tablename__ = "raid_lockdown_channels"
-    __table_args__ = (UniqueConstraint("guild_id", "channel_id"),)
+    __table_args__ = (
+        Index("ix_raid_lockdown_restore_retry", "guild_id", "next_restore_attempt_at"),
+    )
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     guild_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("guilds.id", ondelete="CASCADE"), nullable=False)
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -509,6 +511,9 @@ class RaidLockdownChannel(Base):
     allow_bits: Mapped[int] = mapped_column(BigInteger, nullable=False)
     deny_bits: Mapped[int] = mapped_column(BigInteger, nullable=False)
     locked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    restore_attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    next_restore_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    restore_last_error: Mapped[str | None] = mapped_column(String(500))
 
 class TemporaryRole(Base):
     __tablename__ = "temporary_roles"
@@ -589,6 +594,7 @@ class Backup(Base, Timestamped):
 
 class Reminder(Base):
     __tablename__ = "reminders"
+    __table_args__ = (Index("ix_reminders_pending_delivery", "sent_at", "due_at", "next_attempt_at"),)
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     guild_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("guilds.id", ondelete="CASCADE"))
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -597,6 +603,9 @@ class Reminder(Base):
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     delivery: Mapped[str] = mapped_column(String(10), default="channel", nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(String(500))
 
 class GuildPermission(Base):
     __tablename__ = "guild_permissions"

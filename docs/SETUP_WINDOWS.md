@@ -8,7 +8,11 @@ Install Python 3.12 or newer, Docker Desktop and a Discord application with a bo
 
 Copy `.env.example` to `.env`.
 
-Set the Discord bot token, application client ID, application client secret, dashboard redirect URI and application secret. Do not commit `.env`.
+Set the Discord bot token, application client ID, application client secret, dashboard redirect URI and application secret. Generate a strong secret key with:
+
+`py -3.12 -c "import secrets; print(secrets.token_urlsafe(48))"`
+
+Copy the output into `APP_SECRET_KEY` in `.env`. The key must be at least 32 characters. In production, `DISCORD_REDIRECT_URI` and `DASHBOARD_URL` must use HTTPS. Do not commit `.env`.
 
 ## Infrastructure
 
@@ -70,3 +74,4 @@ Enable the required Discord intents in the Developer Portal before using message
 ### Sincronização de comandos em desenvolvimento
 
 Defina `DISCORD_GUILD_ID` no `.env` para que o BN Bot publique a árvore atual diretamente na sua guild durante o desenvolvimento. Isso evita o uso de uma assinatura global antiga enquanto o Discord propaga alterações globais.
+

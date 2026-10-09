@@ -1,4 +1,6 @@
 from __future__ import annotations
+import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 import io
 import logging
@@ -240,6 +242,45 @@ class CommunityCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.registered_views: set[str] = set()
+        self._message_refresh_tasks: dict[str, asyncio.Task[None]] = {}
+        self._message_refreshing: set[str] = set()
+        self._message_refresh_pending: set[str] = set()
+
+    def cog_unload(self) -> None:
+        for task in self._message_refresh_tasks.values():
+            task.cancel()
+        self._message_refresh_tasks.clear()
+        self._message_refreshing.clear()
+        self._message_refresh_pending.clear()
+
+    def schedule_message_refresh(self, key: str, callback: Callable[[], Awaitable[None]]) -> None:
+        task = self._message_refresh_tasks.get(key)
+        if task is not None and not task.done():
+            if key in self._message_refreshing:
+                self._message_refresh_pending.add(key)
+            return
+        self._message_refresh_tasks[key] = asyncio.create_task(self._run_debounced_refresh(key, callback))
+
+    async def _run_debounced_refresh(self, key: str, callback: Callable[[], Awaitable[None]]) -> None:
+        try:
+            while True:
+                await asyncio.sleep(2)
+                self._message_refreshing.add(key)
+                try:
+                    await callback()
+                finally:
+                    self._message_refreshing.discard(key)
+                if key not in self._message_refresh_pending:
+                    break
+                self._message_refresh_pending.discard(key)
+        except Exception:
+            logger.exception("debounced community message refresh failed key=%s", key)
+        finally:
+            self._message_refreshing.discard(key)
+            self._message_refresh_pending.discard(key)
+            current = asyncio.current_task()
+            if self._message_refresh_tasks.get(key) is current:
+                self._message_refresh_tasks.pop(key, None)
 
     async def get_guild_settings(self, guild_id: int) -> GuildSettings | None:
         async with session_factory() as session:
@@ -313,7 +354,7 @@ class CommunityCog(commands.Cog):
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
         try:
-            message = await channel.fetch_message(message_id)
+            message = channel.get_partial_message(message_id)
             if giveaway.status == "active":
                 page = await self.build_giveaway_message(giveaway, entry_count)
                 await message.edit(embed=page, view=GiveawayView(self, giveaway.id))
@@ -343,7 +384,7 @@ class CommunityCog(commands.Cog):
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
         try:
-            message = await channel.fetch_message(message_id)
+            message = channel.get_partial_message(message_id)
             page = embed("BN / ENQUETE", question, "community")
             total = sum(counts)
             rows = [f"**{index + 1}. {option}** · `{count}` · {percent(count, total)}\n{bar(count, total, 10)}" for index, (option, count) in enumerate(zip(options, counts))]
@@ -525,6 +566,10 @@ class CommunityCog(commands.Cog):
         if member is None or not await is_staff(guild, member):
             await respond(interaction, "Você não possui permissão para fechar este ticket.", ephemeral=True)
             return
+        cooldown = await check_and_set(f"bn:ticket-close:{guild.id}:{interaction.user.id}", 20)
+        if cooldown is not None:
+            await respond(interaction, f"Você fechou um ticket recentemente. Aguarde {cooldown}s antes de tentar novamente.", ephemeral=True)
+            return
         async with session_factory() as lookup_session:
             ticket_row = await lookup_session.get(Ticket, ticket_id)
             if ticket_row is None or ticket_row.guild_id != guild.id:
@@ -538,7 +583,8 @@ class CommunityCog(commands.Cog):
         transcript = ""
         if isinstance(channel, discord.TextChannel):
             lines = []
-            async for message in channel.history(limit=None, oldest_first=True):
+            max_transcript_messages = 1000
+            async for message in channel.history(limit=max_transcript_messages, oldest_first=True):
                 content = message.content.replace("\n", " ").strip() or "[sem texto]"
                 extras = []
                 if message.attachments:
@@ -547,6 +593,8 @@ class CommunityCog(commands.Cog):
                     extras.append(f"[embeds] {len(message.embeds)}")
                 suffix = " | " + " | ".join(extras) if extras else ""
                 lines.append(f"{message.created_at.isoformat()} | {message.author} ({message.author.id}) | {content}{suffix}")
+            if len(lines) >= max_transcript_messages:
+                lines.append(f"[Transcript limitado a {max_transcript_messages} mensagens para proteger a estabilidade do Discord.]")
             transcript = "\n".join(lines)
             opener = guild.get_member(opener_id)
             if opener:
@@ -770,6 +818,10 @@ class CommunityCog(commands.Cog):
 
     async def suggestion_vote(self, interaction: discord.Interaction, suggestion_id: int, value: int) -> None:
         await defer(interaction, ephemeral=True)
+        retry_after = await check_and_set(f"bn:suggestion-vote:{interaction.guild_id or 0}:{interaction.user.id}", 2)
+        if retry_after is not None:
+            await respond(interaction, f"Aguarde {retry_after}s antes de votar novamente.", ephemeral=True)
+            return
         async with session_factory() as session:
             suggestion = await session.get(Suggestion, suggestion_id)
             if suggestion is None or suggestion.guild_id != interaction.guild_id or suggestion.status not in {"pending", "analysis"}:
@@ -780,7 +832,10 @@ class CommunityCog(commands.Cog):
             upvotes, downvotes = await cast_suggestion_vote(session, suggestion_id, interaction.user.id, value, interaction.guild_id)
             changed = (before_up, before_down) != (upvotes, downvotes)
             await session.commit()
-        await self.refresh_suggestion_message(interaction.guild, suggestion_id, upvotes, downvotes)
+        self.schedule_message_refresh(
+            f"suggestion:{interaction.guild_id}:{suggestion_id}",
+            lambda: self.refresh_suggestion_message(interaction.guild, suggestion_id),
+        )
         if changed:
             label = "apoio" if value == 1 else "não apoio"
             page = embed("BN / VOTO REGISTRADO", "Sua posição foi atualizada.", "community")
@@ -793,7 +848,7 @@ class CommunityCog(commands.Cog):
             page.add_field(name="Balanço", value=f"A favor `{number(upvotes)}` · contra `{number(downvotes)}`", inline=False)
             await respond(interaction, embed=page, ephemeral=True)
 
-    async def refresh_suggestion_message(self, guild: discord.Guild | None, suggestion_id: int, upvotes: int, downvotes: int) -> None:
+    async def refresh_suggestion_message(self, guild: discord.Guild | None, suggestion_id: int) -> None:
         if guild is None:
             return
         async with session_factory() as session:
@@ -803,10 +858,8 @@ class CommunityCog(commands.Cog):
         channel = self.resolve_channel(guild, suggestion.channel_id)
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
-        suggestion.upvotes = upvotes
-        suggestion.downvotes = downvotes
         try:
-            message = await channel.fetch_message(suggestion.message_id)
+            message = channel.get_partial_message(suggestion.message_id)
             await message.edit(embed=await self.build_suggestion_message(suggestion), view=SuggestionView(self, suggestion.id) if suggestion.status in {"pending", "analysis"} else None)
         except discord.HTTPException:
             logger.exception("suggestion panel refresh failed suggestion=%s", suggestion_id)
@@ -835,7 +888,7 @@ class CommunityCog(commands.Cog):
                 await respond(interaction, str(exc), ephemeral=True)
                 return
             await session.commit()
-        await self.refresh_suggestion_message(guild, row.id, row.upvotes, row.downvotes)
+        await self.refresh_suggestion_message(guild, row.id)
         await respond(interaction, f"Sugestão #{row.id} atualizada para {row.status}.", ephemeral=True)
 
     @command_rate_limit("report", 30)
@@ -1069,6 +1122,10 @@ class CommunityCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None
         await defer(interaction, ephemeral=True)
+        retry_after = await check_and_set(f"bn:giveaway-enter:{guild.id}:{interaction.user.id}", 3)
+        if retry_after is not None:
+            await respond(interaction, f"Aguarde {retry_after}s antes de alterar sua participação.", ephemeral=True)
+            return
         member = interaction.user if isinstance(interaction.user, discord.Member) else None
         if member is None:
             await respond(interaction, "Não foi possível validar sua conta neste servidor.", ephemeral=True)
@@ -1105,7 +1162,10 @@ class CommunityCog(commands.Cog):
                     return
             entered = await enter_giveaway(session, giveaway_id, member.id)
             await session.commit()
-        await self.refresh_giveaway_message(guild, giveaway_id)
+        self.schedule_message_refresh(
+            f"giveaway:{guild.id}:{giveaway_id}",
+            lambda: self.refresh_giveaway_message(guild, giveaway_id),
+        )
         page = embed("BN / SORTEIO", "Participação atualizada.", "community")
         page.add_field(name="Estado", value=status_line("Participação", "ativa" if entered else "removida", "active" if entered else "closed"), inline=True)
         page.add_field(name="Sorteio", value=f"`#{giveaway_id}`", inline=True)
@@ -1261,6 +1321,10 @@ class CommunityCog(commands.Cog):
 
     async def poll_vote(self, interaction: discord.Interaction, poll_id: int, option_index: int) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
+        retry_after = await check_and_set(f"bn:poll-vote:{interaction.guild_id or 0}:{interaction.user.id}", 2)
+        if retry_after is not None:
+            await interaction.followup.send(f"Aguarde {retry_after}s antes de votar novamente.", ephemeral=True)
+            return
         try:
             async with session_factory() as session:
                 poll = await session.get(Poll, poll_id)
@@ -1274,7 +1338,10 @@ class CommunityCog(commands.Cog):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        await self.refresh_poll_message(interaction.guild, poll_id)
+        self.schedule_message_refresh(
+            f"poll:{interaction.guild_id}:{poll_id}",
+            lambda: self.refresh_poll_message(interaction.guild, poll_id),
+        )
         page = embed("BN / VOTO", "Seu voto foi registrado.", "community")
         page.add_field(name="Escolha", value=f"**{selected_option}**", inline=False)
         page.add_field(name="Total", value=f"`{number(sum(counts))}` votos", inline=True)

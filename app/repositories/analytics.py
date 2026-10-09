@@ -17,7 +17,7 @@ async def overview(session: AsyncSession, guild_id: int) -> dict[str, int | floa
 
 
 COMMAND_CATEGORIES = {
-    "normal": {"ping", "uptime", "botinfo", "serverinfo", "userinfo", "avatar", "remind", "tutorial", "dashboard", "history", "donate"},
+    "normal": {"ping", "uptime", "botinfo", "serverinfo", "userinfo", "avatar", "remind", "tutorial", "dashboard", "history"},
     "economia": {"balance", "bank", "deposit", "withdraw", "pay", "daily", "weekly", "shop", "buy", "sell", "inventory", "transactions", "jobs", "job", "work"},
     "progressao": {"profile", "rep", "reps", "leaderboard"},
     "moderacao": {"warn", "t-warn", "warns", "unwarn", "clearwarns", "timeout", "untimeout", "unmute", "kick", "ban", "unban", "purge"},

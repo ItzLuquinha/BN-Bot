@@ -8,17 +8,17 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import select, desc, func
 from app.core.db import session_factory
+from app.core.interactions import defer, respond
 from app.services.diagnostics import run_diagnostics
-from app.repositories.analytics import CATEGORY_LABELS, COMMAND_CATEGORIES, command_category
+from app.repositories.analytics import COMMAND_CATEGORIES
 from app.models import AuditLog, CommandUsage, Reminder
 from app.core.time import utc_now
-from app.discord.theme import bar, embed, duration, number, ledger, status_line
+from app.discord.theme import embed, duration, number, ledger, status_line
 from app.discord.app_contexts import user_installable
 from app.services.permissions import required_permission_text
 
 from app.services.rate_limits import command_rate_limit
 logger = logging.getLogger("bn_bot.discord.utility")
-
 
 CRITICAL_DIAGNOSTIC_NAMES = {
     "PostgreSQL",
@@ -42,12 +42,10 @@ CRITICAL_DIAGNOSTIC_NAMES = {
     "Dashboard",
 }
 
-
 def diagnostic_severity(result: object) -> str:
     if getattr(result, "ok", False):
         return "OK"
     return "CRÍTICO" if getattr(result, "name", "") in CRITICAL_DIAGNOSTIC_NAMES else "ATENÇÃO"
-
 
 ACCESS_COMMAND_ORDER = (
     "normal",
@@ -59,7 +57,6 @@ ACCESS_COMMAND_ORDER = (
     "administracao",
     "diversao",
 )
-
 
 def tutorial_access_lines(category: str) -> list[str]:
     names = list(COMMAND_CATEGORIES.get(category, set()))
@@ -74,7 +71,6 @@ def tutorial_access_lines(category: str) -> list[str]:
     elif category == "seguranca":
         lines.insert(0, "`/automod ...` e `/antiraid ...` · Gerenciar Servidor")
     return lines
-
 
 class TutorialSelect(discord.ui.Select):
     def __init__(self, categories: dict[str, dict[str, object]]) -> None:
@@ -110,7 +106,6 @@ class TutorialSelect(discord.ui.Select):
                     page.add_field(name=f"Acesso aos comandos{suffix}", value="\n".join(chunk)[:1024], inline=False)
         await interaction.response.edit_message(embed=page, view=self.view)
 
-
 class TutorialView(discord.ui.View):
     def __init__(self, categories: dict[str, dict[str, object]]) -> None:
         super().__init__(timeout=300)
@@ -125,7 +120,6 @@ class TutorialView(discord.ui.View):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
-
 
 class TestallErrorsView(discord.ui.View):
     def __init__(self, owner_id: int, errors: list[object]) -> None:
@@ -147,11 +141,12 @@ class TestallErrorsView(discord.ui.View):
         chunk = self.errors[start:start + self.page_size]
         critical = sum(diagnostic_severity(result) == "CRÍTICO" for result in self.errors)
         warnings = len(self.errors) - critical
-        page = embed("BN / TESTALL · ERROS", f"Falhas encontradas · `{len(self.errors)}` no total · `{critical}` críticos · `{warnings}` atenção", "moderation")
+        failure_label = "falha" if len(self.errors) == 1 else "falhas"
+        critical_label = "crítica" if critical == 1 else "críticas"
+        page = embed("BN / TESTALL · ERROS", f"{len(self.errors)} {failure_label} · {critical} {critical_label} · {warnings} atenção", "moderation")
         for result in chunk:
             severity = diagnostic_severity(result)
-            page.add_field(name=f"{severity} · {getattr(result, 'name', 'desconhecido')}", value=str(getattr(result, 'detail', 'sem detalhes'))[:1024], inline=False)
-        page.set_footer(text=f"BN Bot · erros · página {self.page_index + 1}/{max(1, (len(self.errors) + self.page_size - 1) // self.page_size)}")
+            page.add_field(name=f"{severity} · {getattr(result, 'name', 'desconhecido')}", value=str(getattr(result, 'detail', 'sem detalhes'))[:500], inline=False)
         return page
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -176,7 +171,6 @@ class TestallErrorsView(discord.ui.View):
         self.page_index = min(total - 1, self.page_index + 1)
         self._refresh()
         await interaction.response.edit_message(embed=self._page(), view=self)
-
 
 class TestallView(discord.ui.View):
     def __init__(self, owner_id: int, pages: list[discord.Embed], failed_results: list[object]) -> None:
@@ -235,32 +229,16 @@ class TestallView(discord.ui.View):
         error_view = TestallErrorsView(self.owner_id, self.failed_results)
         await interaction.response.send_message(embed=error_view._page(), view=error_view, ephemeral=True)
 
-
 class UtilityCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.started_at = time.monotonic()
 
     @user_installable
-    @app_commands.command(name="donate", description="Apoie o Rian e o vix pelo PayPal.")
-    async def donate(self, interaction: discord.Interaction) -> None:
-        page = embed("BN / APOIE RIAN & VIX", "Se você quiser apoiar o BN Bot e os projetos de Rian & Vix, use o botão abaixo.", "community")
-        page.add_field(name="PayPal", value="`@RianBraga`", inline=True)
-        page.add_field(name="Destino", value="Apoio aos projetos e à manutenção do BN Bot.", inline=True)
-        view = discord.ui.View(timeout=300)
-        view.add_item(discord.ui.Button(label="Apoiar via PayPal", style=discord.ButtonStyle.link, url="https://paypal.me/RianBraga"))
-        await interaction.response.send_message(embed=page, view=view)
-
-    @user_installable
     @app_commands.command(name="ping", description="Mostra a latência do BN Bot.")
     async def ping(self, interaction: discord.Interaction) -> None:
         latency = max(round(self.bot.latency * 1000), 0)
-        page = embed("BN / PING", "Uma leitura rápida do caminho até o Gateway.", "system")
-        page.add_field(name="Gateway", value=f"`{latency} ms`", inline=True)
-        page.add_field(name="Estado", value=status_line("Conexão", "pronta" if self.bot.is_ready() else "indisponível", "ok" if self.bot.is_ready() else "error"), inline=True)
-        quality = max(0, min(150, 150 - latency))
-        page.add_field(name="Sinal", value=f"{bar(quality, 150, 12)}\n`{latency} ms` de latência", inline=False)
-        await interaction.response.send_message(embed=page)
+        await interaction.response.send_message(f"Pong! `{latency} ms`")
 
     @user_installable
     @app_commands.command(name="uptime", description="Mostra o uptime do BN Bot.")
@@ -467,52 +445,47 @@ class UtilityCog(commands.Cog):
         except discord.HTTPException:
             pass
 
-
     @command_rate_limit("history", 5)
-    @app_commands.command(name="history", description="Mostra os últimos comandos usados no servidor, separados por categoria.")
+    @app_commands.command(name="history", description="Mostra os comandos usados recentemente neste servidor.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.choices(category=[
-        app_commands.Choice(name="Todos", value="all"),
-        app_commands.Choice(name="Normais", value="normal"),
-        app_commands.Choice(name="Economia", value="economia"),
-        app_commands.Choice(name="Progressão", value="progressao"),
-        app_commands.Choice(name="Moderação", value="moderacao"),
-        app_commands.Choice(name="Comunidade", value="comunidade"),
-        app_commands.Choice(name="Segurança", value="seguranca"),
-        app_commands.Choice(name="Administração", value="administracao"),
-        app_commands.Choice(name="Diversão", value="diversao"),
-    ])
-    @app_commands.describe(limit="Quantidade de registros", category="Filtre por categoria")
-    async def history(self, interaction: discord.Interaction, limit: app_commands.Range[int, 5, 50] = 25, category: str = "all") -> None:
+    @app_commands.describe(limit="Quantidade de registros, de 1 a 50")
+    async def history(self, interaction: discord.Interaction, limit: app_commands.Range[int, 1, 50] = 20) -> None:
         guild = interaction.guild
         assert guild is not None
         await defer(interaction, ephemeral=True)
-        async with session_factory() as session:
-            stmt = select(CommandUsage).where(CommandUsage.guild_id == guild.id).order_by(desc(CommandUsage.used_at)).limit(int(limit))
-            if category != "all":
-                stmt = select(CommandUsage).where(CommandUsage.guild_id == guild.id, CommandUsage.category == category).order_by(desc(CommandUsage.used_at)).limit(int(limit))
-            rows = list((await session.execute(stmt)).scalars().all())
-        page = embed("BN / HISTÓRICO DE COMANDOS", "Leitura dos últimos comandos usados neste servidor.", "system")
+        try:
+            async with session_factory() as session:
+                stmt = (
+                    select(CommandUsage)
+                    .where(CommandUsage.guild_id == guild.id)
+                    .order_by(desc(CommandUsage.used_at))
+                    .limit(int(limit))
+                )
+                rows = list((await session.execute(stmt)).scalars().all())
+        except Exception:
+            logger.exception("command history query failed guild=%s", guild.id)
+            await respond(interaction, "Não foi possível carregar o histórico agora.", ephemeral=True)
+            return
+
         if not rows:
-            page.add_field(name="Sem registros", value="Ainda não há uso de comandos registrado para este filtro.", inline=False)
-        else:
-            grouped: dict[str, list[str]] = {}
-            for row in rows:
-                member = guild.get_member(row.user_id)
-                actor = member.mention if member else f"<@{row.user_id}>"
-                state = "OK" if row.success else f"ERRO: {row.error_type or 'desconhecido'}"
-                timestamp = discord.utils.format_dt(row.used_at, "R")
-                grouped.setdefault(row.category, []).append(f"{timestamp} · {actor} · `/{row.command_name}` · {state}")
-            order = ("administracao", "moderacao", "seguranca", "comunidade", "economia", "progressao", "diversao", "normal")
-            for key in order:
-                lines = grouped.get(key)
-                if not lines:
-                    continue
-                label = CATEGORY_LABELS.get(key, key.title())
-                page.add_field(name=f"{label} · {len(lines)}", value="\n".join(lines)[:1024], inline=False)
-            page.add_field(name="Filtro", value="Todos" if category == "all" else CATEGORY_LABELS.get(category, category), inline=True)
-            page.add_field(name="Registros", value=f"`{len(rows)}`", inline=True)
+            await respond(interaction, "Nenhum comando foi registrado ainda.", ephemeral=True)
+            return
+
+        lines: list[str] = []
+        for row in rows:
+            member = guild.get_member(row.user_id)
+            actor = discord.utils.escape_markdown(member.display_name[:32]) if member else "Usuário indisponível"
+            command_name = discord.utils.escape_markdown(row.command_name[:40])
+            outcome = "OK" if row.success else f"ERRO: {discord.utils.escape_markdown((row.error_type or 'falha')[:24])}"
+            line = f"{discord.utils.format_dt(row.used_at, 'R')} · {actor} · `/{command_name}` · {outcome}"
+            candidate = "\n".join((*lines, line))
+            if len(candidate) > 3800:
+                lines.append("… demais registros omitidos")
+                break
+            lines.append(line)
+
+        page = embed("BN / HISTÓRICO", "\n".join(lines), "system")
         await respond(interaction, embed=page, ephemeral=True)
 
     @command_rate_limit("testall", 30)
@@ -529,27 +502,19 @@ class UtilityCog(commands.Cog):
         passed = sum(result.ok for result in results)
         failed = len(results) - passed
         failed_results = [result for result in results if not result.ok]
-        critical_failures = [result for result in failed_results if diagnostic_severity(result) == "CRÍTICO"]
-        warning_failures = [result for result in failed_results if diagnostic_severity(result) == "ATENÇÃO"]
         per_page = 8
         pages: list[discord.Embed] = []
         chunks = [results[index:index + per_page] for index in range(0, len(results), per_page)]
         page_count = len(chunks)
         for index, chunk in enumerate(chunks):
             if index == 0:
-                description = f"**{passed} OK** · **{failed} falhas** · `{len(results)} testes` · `{elapsed:.2f}s`"
+                description = f"{passed} OK · {failed} falhas"
             else:
-                description = f"Página {index + 1} de {page_count} · relatório técnico"
+                description = f"Página {index + 1}/{page_count}"
             page = embed("BN / TESTALL", description, "system")
             for result in chunk:
                 marker = diagnostic_severity(result)
                 page.add_field(name=f"{marker} · {result.name}", value=result.detail[:1024], inline=False)
-            if index == 0:
-                summary = " · ".join(result.name for result in failed_results[:6]) if failed_results else "Integridade geral confirmada."
-                page.add_field(name="Leitura rápida", value=summary, inline=False)
-                page.add_field(name="Severidade", value=f"Críticos: `{len(critical_failures)}`\nAtenção: `{len(warning_failures)}`", inline=True)
-                page.add_field(name="Saúde", value=f"{bar(passed, len(results), 16)}\n`{passed}/{len(results)}` verificações OK", inline=True)
-            page.set_footer(text=f"BN Bot · sistema · página {index + 1}/{page_count}")
             pages.append(page)
         view = TestallView(interaction.user.id, pages, failed_results)
         await interaction.edit_original_response(embed=pages[0], view=view)

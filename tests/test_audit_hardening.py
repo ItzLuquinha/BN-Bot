@@ -56,3 +56,45 @@ def test_removed_gif_is_absent_from_the_project() -> None:
         if "__pycache__" in path.parts:
             continue
         assert needle not in path.read_text(encoding="utf-8")
+
+
+def test_dashboard_guild_cache_coalesces_concurrent_discord_requests() -> None:
+    source = Path("app/dashboard/main.py").read_text(encoding="utf-8")
+    block = source[source.index("async def session_guilds"):source.index("async def authorized_guild")]
+    assert "GUILD_CACHE_TTL_SECONDS = 30" in source
+    assert "nx=True" in block
+    assert "GUILD_CACHE_LOCK_SECONDS" in block
+    assert "await redis_client.eval(_CACHE_LOCK_RELEASE" in block
+    assert "json.dumps(dashboard_guilds)" in source
+    assert 'json.dumps(result), ex=GUILD_CACHE_TTL_SECONDS' in block
+
+
+def test_command_sync_uses_bounded_retries_and_avoids_re_syncing_successful_guilds() -> None:
+    source = Path("app/discord/bot.py").read_text(encoding="utf-8")
+    block = source[source.index("def _command_sync_retry_delay"):source.index("async def _ensure_registered_guilds")]
+    assert "error.retry_after" in block
+    assert "for attempt in range(5)" in block
+    assert "min(max(retry_after, delay * 2), 900.0)" in block
+    sync_scopes = source[source.index("async def _sync_command_scopes"):source.index("async def _restore_voice_sessions")]
+    assert "if guild.id in self._synced_guild_command_ids" in sync_scopes
+    assert "await asyncio.gather(*retry_tasks, return_exceptions=True)" in source
+
+
+def test_community_actions_debounce_public_message_edits() -> None:
+    source = Path("app/discord/cogs/community.py").read_text(encoding="utf-8")
+    assert "async def _run_debounced_refresh" in source
+    assert "await asyncio.sleep(2)" in source
+    assert "channel.get_partial_message" in source
+    assert 'check_and_set(f"bn:suggestion-vote:' in source
+    assert 'check_and_set(f"bn:giveaway-enter:' in source
+    assert 'check_and_set(f"bn:poll-vote:' in source
+    assert "def cog_unload(self)" in source
+
+
+def test_reminder_retry_honors_discord_retry_after_and_has_a_finite_attempt_budget() -> None:
+    source = Path("app/tasks/worker.py").read_text(encoding="utf-8")
+    block = source[source.index("async def reminders"):source.index("@reminders.before_loop")]
+    assert "max_attempts = 5" in block
+    assert "except discord.RateLimited as exc" in block
+    assert "delay = max(delay, int(discord_retry_after + 0.999))" in block
+    assert "reminder.next_attempt_at = utc_now() + timedelta(seconds=delay)" in block

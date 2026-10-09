@@ -2,7 +2,7 @@ import logging
 from datetime import timedelta
 import discord
 from discord.ext import tasks
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from app.core.db import session_factory
 from app.core.time import utc_now
 from app.models import Reminder, TemporaryRole, Warning
@@ -28,47 +28,95 @@ class Worker:
 
     @tasks.loop(seconds=15)
     async def reminders(self) -> None:
+        now = utc_now()
+        max_attempts = 5
+        retry_delays = (60, 300, 900, 3600)
         try:
             async with session_factory() as session:
-                result = await session.execute(select(Reminder).where(Reminder.sent_at.is_(None), Reminder.due_at <= utc_now()).limit(50).with_for_update(skip_locked=True))
+                result = await session.execute(
+                    select(Reminder)
+                    .where(
+                        Reminder.sent_at.is_(None),
+                        Reminder.due_at <= now,
+                        Reminder.attempt_count < max_attempts,
+                        or_(Reminder.next_attempt_at.is_(None), Reminder.next_attempt_at <= now),
+                    )
+                    .order_by(Reminder.due_at)
+                    .limit(50)
+                    .with_for_update(skip_locked=True)
+                )
                 rows = list(result.scalars())
                 for reminder in rows:
                     delivered = False
-                    if reminder.delivery == "dm":
-                        user = self.bot.get_user(reminder.user_id)
-                        if user is None:
-                            try:
+                    permanent_failure = False
+                    error_text: str | None = None
+                    discord_retry_after: float | None = None
+
+                    try:
+                        if reminder.delivery == "dm":
+                            user = self.bot.get_user(reminder.user_id)
+                            if user is None:
                                 user = await self.bot.fetch_user(reminder.user_id)
-                            except Exception:
-                                user = None
-                        if user is not None:
-                            try:
-                                await user.send(reminder.message)
-                                delivered = True
-                            except Exception:
-                                logger.exception("reminder DM delivery failed user=%s reminder=%s", reminder.user_id, reminder.id)
-                    elif reminder.channel_id:
-                        channel = self.bot.get_channel(reminder.channel_id)
-                        if channel is None and reminder.guild_id:
-                            guild = self.bot.get_guild(reminder.guild_id)
-                            if guild is not None:
-                                channel = guild.get_thread(reminder.channel_id)
-                                if channel is None:
-                                    try:
+                            await user.send(reminder.message)
+                            delivered = True
+                        elif reminder.channel_id:
+                            channel = self.bot.get_channel(reminder.channel_id)
+                            if channel is None and reminder.guild_id:
+                                guild = self.bot.get_guild(reminder.guild_id)
+                                if guild is not None:
+                                    channel = guild.get_thread(reminder.channel_id)
+                                    if channel is None:
                                         channel = await guild.fetch_channel(reminder.channel_id)
-                                    except Exception:
-                                        channel = None
-                        if channel is not None:
-                            try:
-                                await channel.send(
-                                    f"<@{reminder.user_id}> {reminder.message}",
-                                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-                                )
-                                delivered = True
-                            except Exception:
-                                logger.exception("reminder channel delivery failed channel=%s reminder=%s", reminder.channel_id, reminder.id)
+                            if channel is None:
+                                raise RuntimeError("reminder destination is not currently available")
+                            await channel.send(
+                                f"<@{reminder.user_id}> {reminder.message}",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                            )
+                            delivered = True
+                        else:
+                            raise ValueError("reminder has no valid delivery destination")
+                    except discord.RateLimited as exc:
+                        discord_retry_after = max(float(getattr(exc, "retry_after", 1.0)), 1.0)
+                        error_text = f"RateLimited: retry_after={discord_retry_after:.2f}s"[:500]
+                    except (discord.NotFound, discord.Forbidden, ValueError) as exc:
+                        permanent_failure = True
+                        error_text = f"{type(exc).__name__}: {exc}"[:500]
+                    except Exception as exc:
+                        error_text = f"{type(exc).__name__}: {exc}"[:500]
+
                     if delivered:
                         reminder.sent_at = utc_now()
+                        reminder.next_attempt_at = None
+                        reminder.last_error = None
+                        logger.info("reminder delivered id=%s delivery=%s", reminder.id, reminder.delivery)
+                        continue
+
+                    reminder.attempt_count += 1
+                    if permanent_failure:
+                        reminder.attempt_count = max_attempts
+                    reminder.last_error = error_text or "Delivery failed"
+                    if reminder.attempt_count < max_attempts:
+                        delay = retry_delays[min(reminder.attempt_count - 1, len(retry_delays) - 1)]
+                        if discord_retry_after is not None:
+                            delay = max(delay, int(discord_retry_after + 0.999))
+                        reminder.next_attempt_at = utc_now() + timedelta(seconds=delay)
+                        logger.warning(
+                            "reminder delivery deferred id=%s attempt=%s/%s retry_seconds=%s error=%s",
+                            reminder.id,
+                            reminder.attempt_count,
+                            max_attempts,
+                            delay,
+                            reminder.last_error,
+                        )
+                    else:
+                        reminder.next_attempt_at = None
+                        logger.error(
+                            "reminder delivery abandoned id=%s attempts=%s error=%s",
+                            reminder.id,
+                            reminder.attempt_count,
+                            reminder.last_error,
+                        )
                 await session.commit()
         except Exception:
             logger.exception("reminders worker iteration failed")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import importlib.metadata
 import re
 import secrets
@@ -131,7 +132,6 @@ REQUIRED_COMMANDS = {
     "history",
     "testall",
     "dashboard",
-    "donate",
     "remind",
     "balance",
     "bank",
@@ -440,7 +440,7 @@ def _admin_command_layout_check(bot: Any) -> DiagnosticResult:
         if admin is None:
             return DiagnosticResult("Admin command layout", False, "grupo /admin não registrado")
         names = {command.name for command in getattr(admin, "commands", [])}
-        required = {"credit", "debit", "shop-add", "job-add", "timezone"}
+        required = {"credit", "debit", "shop-add", "job-add", "job-remove", "rewards", "timezone"}
         missing = sorted(required - names)
         if bot.tree.get_command("credit") is not None:
             missing.append("credit está duplicado fora de /admin")
@@ -1094,6 +1094,7 @@ def _dependency_check() -> DiagnosticResult:
     return DiagnosticResult("Dependências", not missing, detail if not missing else f"dependências ausentes: {', '.join(missing)}")
 
 
+
 def _environment_files_check() -> DiagnosticResult:
     try:
         example = _project_root() / ".env.example"
@@ -1287,10 +1288,23 @@ def _workers_check(bot: Any) -> DiagnosticResult:
 def _command_option_signature(options: list[dict[str, Any]] | None) -> tuple:
     result = []
     for option in options or []:
+        choices = tuple(
+            (str(choice.get("name", "")), choice.get("value"))
+            for choice in option.get("choices") or []
+        )
+        channel_types = tuple(_enum_int(value) for value in option.get("channel_types") or [])
         result.append((
             str(option.get("name", "")),
             _enum_int(option.get("type", 0)),
             bool(option.get("required", False)),
+            str(option.get("description", "")),
+            option.get("min_value"),
+            option.get("max_value"),
+            option.get("min_length"),
+            option.get("max_length"),
+            bool(option.get("autocomplete", False)),
+            choices,
+            channel_types,
             _command_option_signature(option.get("options")),
         ))
     return tuple(result)
@@ -1302,15 +1316,28 @@ def _local_command_signature(command: Any, tree: Any) -> tuple:
 
 
 def _remote_option_signature(options: list[dict[str, Any]] | None) -> tuple:
-    return tuple(
-        (
+    signatures = []
+    for option in options or []:
+        choices = tuple(
+            (str(choice.get("name", "")), choice.get("value"))
+            for choice in option.get("choices") or []
+        )
+        channel_types = tuple(_enum_int(value) for value in option.get("channel_types") or [])
+        signatures.append((
             str(option.get("name", "")),
             _enum_int(option.get("type", 0)),
             bool(option.get("required", False)),
+            str(option.get("description", "")),
+            option.get("min_value"),
+            option.get("max_value"),
+            option.get("min_length"),
+            option.get("max_length"),
+            bool(option.get("autocomplete", False)),
+            choices,
+            channel_types,
             _remote_option_signature(option.get("options")),
-        )
-        for option in (options or [])
-    )
+        ))
+    return tuple(signatures)
 
 
 def _remote_command_signatures(commands: list[Any]) -> dict[str, tuple]:
@@ -1332,10 +1359,11 @@ def _remote_command_signatures(commands: list[Any]) -> dict[str, tuple]:
         top_name = str(data.get("name", ""))
         top_type = _enum_int(data.get("type", 0))
         options = data.get("options") or []
-        if top_type == 2:
+        has_subcommands = any(_enum_int(option.get("type", 0)) in {1, 2} for option in options)
+        if has_subcommands:
             walk_options(options, top_name)
         elif top_type == 1:
-            result[top_name] = ("1", top_name, _remote_option_signature(options))
+            result[top_name] = (str(top_type), top_name, _remote_option_signature(options))
         else:
             result[top_name] = (str(top_type), top_name, ())
     return result
@@ -1349,44 +1377,28 @@ def _is_user_installable_local(command: Any) -> bool:
 async def _remote_command_sync_check(bot: Any, guild_id: int) -> DiagnosticResult:
     try:
         import discord
-        guild_object = discord.Object(id=guild_id)
-        guild_remote = await bot.tree.fetch_commands(guild=guild_object)
-        global_remote = await bot.tree.fetch_commands()
+
+        async def fetch_state() -> tuple[list[Any], list[Any]]:
+            guild_object = discord.Object(id=guild_id)
+            return await bot.tree.fetch_commands(guild=guild_object), await bot.tree.fetch_commands()
+
+        guild_remote, global_remote = await fetch_state()
         local_commands = [
             command
             for command in bot.tree.walk_commands()
             if not getattr(command, "commands", None)
         ]
-        local_all = {command.qualified_name: _local_command_signature(command, bot.tree) for command in local_commands}
-        local_guild = {command.qualified_name: _local_command_signature(command, bot.tree) for command in local_commands if not _is_user_installable_local(command)}
-        local_user = {command.qualified_name: _local_command_signature(command, bot.tree) for command in local_commands if _is_user_installable_local(command)}
+        local_guild = {
+            command.qualified_name: _local_command_signature(command, bot.tree)
+            for command in local_commands
+            if not _is_user_installable_local(command)
+        }
+        local_user = {
+            command.qualified_name: _local_command_signature(command, bot.tree)
+            for command in local_commands
+            if _is_user_installable_local(command)
+        }
         settings = get_settings()
-        if settings.app_env == "production":
-            primary = global_remote
-            primary_signatures = _remote_command_signatures(primary)
-            missing = sorted(set(local_all) - set(primary_signatures))
-            stale = sorted(name for name in set(local_all) & set(primary_signatures) if local_all[name][2] != primary_signatures[name][2])
-            secondary = guild_remote
-            secondary_signatures = _remote_command_signatures(secondary)
-            scope_issues: list[str] = []
-            duplicate_primary = sorted({str(getattr(command, "name", "")) for command in primary if sum(1 for candidate in primary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
-            duplicate_secondary = sorted({str(getattr(command, "name", "")) for command in secondary if sum(1 for candidate in secondary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
-            if duplicate_primary:
-                scope_issues.append(f"duplicados globais: {', '.join(duplicate_primary[:6])}")
-            if duplicate_secondary:
-                scope_issues.append(f"duplicados de guilda: {', '.join(duplicate_secondary[:6])}")
-            if secondary_signatures:
-                scope_issues.append(f"comandos de guilda antigos: {len(secondary_signatures)}")
-            if missing or stale or scope_issues:
-                detail = []
-                if missing:
-                    detail.append(f"ausentes no Discord: {', '.join(missing[:6])}")
-                if stale:
-                    detail.append(f"assinatura desatualizada: {', '.join(stale[:6])}")
-                detail.extend(scope_issues)
-                return DiagnosticResult("Discord commands", False, " | ".join(detail))
-            return DiagnosticResult("Discord commands", True, f"{len(primary_signatures)} comandos globais sincronizados; escopo de guilda vazio")
-
         primary = guild_remote
         primary_signatures = _remote_command_signatures(primary)
         global_signatures = _remote_command_signatures(global_remote)
@@ -1396,18 +1408,17 @@ async def _remote_command_sync_check(bot: Any, guild_id: int) -> DiagnosticResul
         user_stale = sorted(name for name in set(local_user) & set(global_signatures) if local_user[name][2] != global_signatures[name][2])
         unexpected_global = sorted(set(global_signatures) - set(local_user))
         overlap = sorted(set(primary_signatures) & set(global_signatures))
-        duplicate_primary = sorted({str(getattr(command, "name", "")) for command in primary if sum(1 for candidate in primary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
-        duplicate_secondary = sorted({str(getattr(command, "name", "")) for command in global_remote if sum(1 for candidate in global_remote if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1})
-        scope_issues = []
-        if duplicate_primary:
-            scope_issues.append(f"duplicados na guilda: {', '.join(duplicate_primary[:6])}")
-        if duplicate_secondary:
-            scope_issues.append(f"duplicados globais: {', '.join(duplicate_secondary[:6])}")
-        if unexpected_global:
-            scope_issues.append(f"globais não autorizados: {', '.join(unexpected_global[:6])}")
-        if overlap:
-            scope_issues.append(f"mesmo comando em guilda e global: {', '.join(overlap[:6])}")
-        issues = []
+        duplicate_primary = sorted({
+            str(getattr(command, "name", ""))
+            for command in primary
+            if sum(1 for candidate in primary if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1
+        })
+        duplicate_secondary = sorted({
+            str(getattr(command, "name", ""))
+            for command in global_remote
+            if sum(1 for candidate in global_remote if getattr(candidate, "name", "") == getattr(command, "name", "")) > 1
+        })
+        issues: list[str] = []
         if missing:
             issues.append(f"ausentes na guilda: {', '.join(missing[:6])}")
         if stale:
@@ -1416,12 +1427,37 @@ async def _remote_command_sync_check(bot: Any, guild_id: int) -> DiagnosticResul
             issues.append(f"user-install ausentes globais: {', '.join(user_missing[:6])}")
         if user_stale:
             issues.append(f"assinatura user-install desatualizada: {', '.join(user_stale[:6])}")
-        issues.extend(scope_issues)
+        if unexpected_global:
+            issues.append(f"globais não autorizados: {', '.join(unexpected_global[:6])}")
+        if overlap:
+            issues.append(f"mesmo comando em guilda e global: {', '.join(overlap[:6])}")
+        if duplicate_primary:
+            issues.append(f"duplicados na guilda: {', '.join(duplicate_primary[:6])}")
+        if duplicate_secondary:
+            issues.append(f"duplicados globais: {', '.join(duplicate_secondary[:6])}")
+
+        if issues and hasattr(bot, "_sync_command_scopes"):
+            try:
+                await bot._sync_command_scopes()
+                guild_remote, global_remote = await fetch_state()
+                primary_signatures = _remote_command_signatures(guild_remote)
+                global_signatures = _remote_command_signatures(global_remote)
+                missing = sorted(set(local_guild) - set(primary_signatures))
+                stale = sorted(name for name in set(local_guild) & set(primary_signatures) if local_guild[name][2] != primary_signatures[name][2])
+                user_missing = sorted(set(local_user) - set(global_signatures))
+                user_stale = sorted(name for name in set(local_user) & set(global_signatures) if local_user[name][2] != global_signatures[name][2])
+                unexpected_global = sorted(set(global_signatures) - set(local_user))
+                overlap = sorted(set(primary_signatures) & set(global_signatures))
+                if not (missing or stale or user_missing or user_stale or unexpected_global or overlap):
+                    return DiagnosticResult("Discord commands", True, f"{len(primary_signatures)} comandos de guilda e {len(global_signatures)} globais user-install sincronizados")
+            except Exception:
+                pass
+
         if issues:
             return DiagnosticResult("Discord commands", False, " | ".join(issues))
-        return DiagnosticResult("Discord commands", True, f"{len(primary_signatures)} comandos de guilda + {len(global_signatures)} user-install, sem duplicações entre escopos")
+        return DiagnosticResult("Discord commands", True, f"{len(primary_signatures)} comandos de guilda e {len(global_signatures)} globais user-install sincronizados")
     except Exception as exc:
-        return DiagnosticResult("Discord commands", False, f"{type(exc).__name__}: {str(exc)[:220]}")
+        return DiagnosticResult("Discord commands", False, f"falha na verificação: {exc}")
 
 async def run_diagnostics(bot: Any, guild_id: int, user_id: int, channel_id: int | None = None) -> list[DiagnosticResult]:
     results: list[DiagnosticResult] = [

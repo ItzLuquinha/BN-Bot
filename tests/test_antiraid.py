@@ -53,3 +53,31 @@ def test_merge_lockdown_guild_ids_includes_pending_retries_without_duplicates() 
     from app.services.antiraid import merge_lockdown_guild_ids
 
     assert merge_lockdown_guild_ids([123, 456], [456, 789]) == [123, 456, 789]
+
+
+def test_expiration_worker_does_not_restore_a_lockdown_before_it_expires() -> None:
+    from pathlib import Path
+
+    source = Path("app/discord/cogs/antiraid.py").read_text(encoding="utf-8")
+    block = source[source.index("async def expire_lockdowns"):source.index("def add_to_tree", source.index("async def expire_lockdowns"))]
+    assert "RaidProtection.active_until.is_(None)" in block
+    assert "RaidProtection.active_until <= now" in block
+    assert "RaidLockdownChannel.next_restore_attempt_at <= now" in block
+
+
+def test_manual_unlock_marks_pending_restoration_as_requested() -> None:
+    from pathlib import Path
+
+    source = Path("app/discord/cogs/antiraid.py").read_text(encoding="utf-8")
+    block = source[source.index('async def unlock'):source.index('async def expire_lockdowns', source.index('async def unlock'))]
+    assert "row.active_until = None" in block
+    assert "pending == 0 else row.active_until" not in block
+
+
+def test_lockdown_persists_restore_state_before_changing_discord_permissions() -> None:
+    from pathlib import Path
+
+    source = Path("app/discord/cogs/antiraid.py").read_text(encoding="utf-8")
+    block = source[source.index("async def apply_lockdown"):source.index("@staticmethod", source.index("async def apply_lockdown"))]
+    assert block.index("await session.commit()") < block.index("await channel.set_permissions(")
+    assert "restore record retained" in block

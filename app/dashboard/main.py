@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
@@ -18,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.sessions import SessionMiddleware
 from app.config import get_settings
 from app.core.db import get_session, session_factory
-from app.core.security import new_state
+from app.core.security import consume_oauth_state, new_state, store_oauth_state
 from app.repositories.analytics import overview
 from app.services.analytics import activity_series, top_channels
 from app.services.automod import ACTIONS, RULE_TYPES, validate_rule_config
@@ -64,23 +65,114 @@ class AutoModListInput(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 async def discord_get(path: str, access_token: str) -> Any:
-    async with httpx.AsyncClient(base_url="https://discord.com/api/v10", timeout=10) as client:
-        response = await client.get(path, headers={"Authorization": f"Bearer {access_token}"})
+    try:
+        async with httpx.AsyncClient(base_url="https://discord.com/api/v10", timeout=10) as client:
+            response = await client.get(path, headers={"Authorization": f"Bearer {access_token}"})
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Discord authentication service timed out") from None
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Discord authentication service unavailable") from None
     if response.status_code == 401:
         raise HTTPException(status_code=401, detail="Discord authentication session expired")
     if response.status_code == 403:
         raise HTTPException(status_code=403, detail="Discord denied access to this resource")
+    if response.status_code == 429:
+        try:
+            retry_after = max(float(response.json().get("retry_after", 1)), 0.0)
+        except (TypeError, ValueError, AttributeError):
+            retry_after = 1.0
+        raise HTTPException(
+            status_code=429,
+            detail="Discord is rate limiting requests. Please retry after the indicated delay.",
+            headers={"Retry-After": str(retry_after)},
+        )
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail="Discord authentication service unavailable")
-    return response.json()
+    try:
+        return response.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Discord returned an invalid JSON response") from None
+
+
+GUILD_CACHE_TTL_SECONDS = 30
+GUILD_CACHE_LOCK_SECONDS = 15
+_CACHE_LOCK_RELEASE = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+
+
+async def _read_cached_guilds(cache_key: str) -> list[dict[str, Any]] | None:
+    cached = await redis_client.get(cache_key)
+    if cached is None:
+        return None
+    try:
+        cached_guilds = json.loads(cached)
+    except (TypeError, ValueError):
+        cached_guilds = None
+    if isinstance(cached_guilds, list) and all(isinstance(guild, dict) for guild in cached_guilds):
+        return cached_guilds
+    await redis_client.delete(cache_key)
+    return None
+
+
+def _manageable_guilds(guilds: Any) -> list[dict[str, Any]]:
+    if not isinstance(guilds, list):
+        raise HTTPException(status_code=502, detail="Discord returned an invalid guild list")
+    result: list[dict[str, Any]] = []
+    for guild in guilds:
+        if not isinstance(guild, dict):
+            continue
+        try:
+            permissions = int(guild.get("permissions", 0))
+        except (TypeError, ValueError):
+            permissions = 0
+        if permissions & 32 or permissions & 8 or bool(guild.get("owner")):
+            result.append(guild)
+    return result
+
+
+async def _active_manageable_guilds(guilds: Any) -> list[dict[str, Any]]:
+    manageable = _manageable_guilds(guilds)
+    if not manageable:
+        return []
+    try:
+        manageable_ids = [int(guild["id"]) for guild in manageable if str(guild.get("id", "")).isdigit()]
+    except (TypeError, ValueError):
+        manageable_ids = []
+    if not manageable_ids:
+        return []
+    async with session_factory() as session:
+        active_ids = set((await session.execute(
+            select(Guild.id).where(Guild.active.is_(True), Guild.id.in_(manageable_ids))
+        )).scalars())
+    return [guild for guild in manageable if str(guild.get("id", "")).isdigit() and int(guild["id"]) in active_ids]
 
 async def discord_token(code: str) -> dict[str, Any]:
     data = {"client_id": settings.discord_client_id, "client_secret": settings.discord_client_secret, "grant_type": "authorization_code", "code": code, "redirect_uri": settings.discord_redirect_uri}
-    async with httpx.AsyncClient(base_url="https://discord.com/api/v10", timeout=10) as client:
-        response = await client.post("/oauth2/token", data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        async with httpx.AsyncClient(base_url="https://discord.com/api/v10", timeout=10) as client:
+            response = await client.post("/oauth2/token", data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Discord OAuth service timed out") from None
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Discord OAuth service unavailable") from None
+    if response.status_code == 429:
+        try:
+            retry_after = max(float(response.json().get("retry_after", 1)), 0.0)
+        except (TypeError, ValueError, AttributeError):
+            retry_after = 1.0
+        raise HTTPException(
+            status_code=429,
+            detail="Discord is rate limiting OAuth requests. Please retry after the indicated delay.",
+            headers={"Retry-After": str(retry_after)},
+        )
     if response.status_code >= 400:
         raise HTTPException(status_code=400, detail="OAuth2 authorization failed")
-    return response.json()
+    try:
+        payload = response.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Discord returned an invalid OAuth response") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Discord returned an invalid OAuth response")
+    return payload
 
 async def get_dashboard_token(request: Request) -> str:
     session_id = request.session.get("dashboard_session")
@@ -88,28 +180,64 @@ async def get_dashboard_token(request: Request) -> str:
         raise HTTPException(status_code=401, detail="Authentication required")
     raw = await redis_client.get(f"bn:dashboard:session:{session_id}")
     if not raw:
+        await redis_client.delete(f"bn:dashboard:guilds:{session_id}")
         request.session.clear()
         raise HTTPException(status_code=401, detail="Authentication session expired")
     try:
         data = json.loads(raw)
     except (TypeError, ValueError):
+        await redis_client.delete(f"bn:dashboard:session:{session_id}", f"bn:dashboard:guilds:{session_id}")
         request.session.clear()
         raise HTTPException(status_code=401, detail="Authentication session expired")
     token = data.get("access_token") if isinstance(data, dict) else None
     if not token:
+        await redis_client.delete(f"bn:dashboard:session:{session_id}", f"bn:dashboard:guilds:{session_id}")
         request.session.clear()
         raise HTTPException(status_code=401, detail="Authentication session expired")
     return token
 
 async def session_guilds(request: Request) -> list[dict[str, Any]]:
+    session_id = request.session.get("dashboard_session")
     token = await get_dashboard_token(request)
-    guilds = await discord_get("/users/@me/guilds", token)
-    manageable = [g for g in guilds if int(g.get("permissions", 0)) & 32 or int(g.get("permissions", 0)) & 8 or bool(g.get("owner"))]
-    if not manageable:
-        return []
-    async with session_factory() as session:
-        active_ids = set((await session.execute(select(Guild.id).where(Guild.active.is_(True), Guild.id.in_([int(g["id"]) for g in manageable])))).scalars())
-    return [g for g in manageable if int(g["id"]) in active_ids]
+    cache_key = f"bn:dashboard:guilds:{session_id}"
+    cached_guilds = await _read_cached_guilds(cache_key)
+    if cached_guilds is not None:
+        return cached_guilds
+
+    lock_key = f"{cache_key}:refresh-lock"
+    lock_value = secrets.token_urlsafe(18)
+    acquired = await redis_client.set(lock_key, lock_value, ex=GUILD_CACHE_LOCK_SECONDS, nx=True)
+    if not acquired:
+        for _ in range(20):
+            await asyncio.sleep(0.1)
+            cached_guilds = await _read_cached_guilds(cache_key)
+            if cached_guilds is not None:
+                return cached_guilds
+        raise HTTPException(
+            status_code=503,
+            detail="The server list is being refreshed. Please retry shortly.",
+            headers={"Retry-After": "2"},
+        )
+
+    try:
+        cached_guilds = await _read_cached_guilds(cache_key)
+        if cached_guilds is not None:
+            return cached_guilds
+        try:
+            guilds = await discord_get("/users/@me/guilds", token)
+        except HTTPException as exc:
+            if exc.status_code == 401:
+                await redis_client.delete(
+                    f"bn:dashboard:session:{session_id}",
+                    f"bn:dashboard:guilds:{session_id}",
+                )
+                request.session.clear()
+            raise
+        result = await _active_manageable_guilds(guilds)
+        await redis_client.set(cache_key, json.dumps(result), ex=GUILD_CACHE_TTL_SECONDS)
+        return result
+    finally:
+        await redis_client.eval(_CACHE_LOCK_RELEASE, 1, lock_key, lock_value)
 
 async def authorized_guild(request: Request, guild_id: int) -> dict[str, Any]:
     guilds = await session_guilds(request)
@@ -127,26 +255,50 @@ async def index(request: Request):
 @app.get("/auth/login")
 async def auth_login(request: Request):
     state = new_state()
-    request.session["oauth_state"] = state
+    store_oauth_state(request.session, state)
     query = urlencode({"client_id": settings.discord_client_id, "response_type": "code", "redirect_uri": settings.discord_redirect_uri, "scope": "identify guilds", "state": state})
     return RedirectResponse(f"https://discord.com/oauth2/authorize?{query}")
 
 @app.get("/auth/callback")
 async def auth_callback(request: Request, code: str, state: str):
-    if not state or state != request.session.pop("oauth_state", None):
-        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+    has_pending_state = bool(request.session.get("oauth_states")) or isinstance(request.session.get("oauth_state"), str)
+    if not consume_oauth_state(request.session, state):
+        if not has_pending_state:
+            detail = "OAuth session cookie was not received or has expired. Open the dashboard and restart login in the same browser, using the same hostname and allowing cookies."
+        else:
+            detail = "OAuth state did not match a pending login. Restart login from the dashboard and do not reuse an older callback URL."
+        raise HTTPException(status_code=400, detail=detail)
     token = await discord_token(code)
     access_token = token.get("access_token")
     if not access_token:
         raise HTTPException(status_code=400, detail="Missing OAuth access token")
     user = await discord_get("/users/@me", access_token)
+    if not isinstance(user, dict) or not str(user.get("id", "")).isdigit():
+        raise HTTPException(status_code=502, detail="Discord returned an invalid user profile")
     guilds = await discord_get("/users/@me/guilds", access_token)
-    allowed = [g for g in guilds if int(g.get("permissions", 0)) & 32 or int(g.get("permissions", 0)) & 8 or bool(g.get("owner"))]
+    allowed = _manageable_guilds(guilds)
     if not allowed:
         raise HTTPException(status_code=403, detail="Your Discord account cannot manage a guild supported by BN Bot")
+    dashboard_guilds = await _active_manageable_guilds(guilds)
     session_id = secrets.token_urlsafe(32)
-    expires_in = int(token.get("expires_in", 3600))
+    try:
+        expires_in = max(1, min(int(token.get("expires_in", 3600)), 86400))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=502, detail="Discord returned an invalid token lifetime") from None
+    previous_session_id = request.session.get("dashboard_session")
+    if previous_session_id:
+        await redis_client.delete(
+            f"bn:dashboard:session:{previous_session_id}",
+            f"bn:dashboard:guilds:{previous_session_id}",
+        )
     await redis_client.set(f"bn:dashboard:session:{session_id}", json.dumps({"access_token": access_token}), ex=expires_in)
+    await redis_client.set(
+        f"bn:dashboard:guilds:{session_id}",
+        json.dumps(dashboard_guilds),
+        ex=min(GUILD_CACHE_TTL_SECONDS, expires_in),
+    )
+    request.session.clear()
+    request.session["csrf"] = new_state()
     request.session["dashboard_session"] = session_id
     request.session["user"] = {"id": user["id"], "username": user.get("username"), "avatar": user.get("avatar")}
     return RedirectResponse("/")
@@ -158,7 +310,7 @@ async def auth_logout(request: Request):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
     session_id = request.session.get("dashboard_session")
     if session_id:
-        await redis_client.delete(f"bn:dashboard:session:{session_id}")
+        await redis_client.delete(f"bn:dashboard:session:{session_id}", f"bn:dashboard:guilds:{session_id}")
     request.session.clear()
     return RedirectResponse("/", status_code=303)
 
