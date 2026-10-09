@@ -16,8 +16,6 @@ from app.models import Guild, GuildSettings
 
 router = APIRouter()
 
-# --- Schemas de Validação (Pydantic) ---
-
 class GuildSettingsUpdateSchema(BaseModel):
     timezone: Optional[str] = Field(None, description="Fuso horário (ex: America/Sao_Paulo)")
     locale: Optional[str] = Field(None, description="Idioma (ex: pt-BR, en-US)")
@@ -32,12 +30,10 @@ class GuildStatusUpdateSchema(BaseModel):
     reason: Optional[str] = Field(None, description="Motivo da desativação (auditoria)")
 
 
-# --- Endpoints ---
-
 @router.get("", summary="Listar servidores acessíveis ao usuário")
 async def list_guilds(
     db: AsyncSession = Depends(get_db),
-    user: dict = Depends(get_current_user)  # Protegido por Token
+    user: dict = Depends(get_current_user) 
 ):
     """
     Retorna apenas os servidores que o usuário logado tem permissão para gerenciar.
@@ -47,10 +43,8 @@ async def list_guilds(
     is_system_staff = role in {SystemRole.ADMIN.value, SystemRole.MODERATOR.value}
 
     if is_system_staff:
-        # Staff do sistema pode ver todos os servidores ativos
         query = select(Guild).where(Guild.active.is_(True))
     else:
-        # Usuário comum: apenas servidores onde ele é Dono OU é Administrador via Discord
         user_id = int(user["id"])
         user_guild_ids = [int(gid) for gid in user.get("guilds", []) if str(gid).isdigit()]
         
@@ -83,7 +77,7 @@ async def list_guilds(
 async def get_guild(
     guild_id: int, 
     db: AsyncSession = Depends(get_db),
-    user: dict = Depends(require_guild_manager)  # Proteção: Dono/Admin do servidor ou Admin do Sistema
+    user: dict = Depends(require_guild_manager)  
 ):
     """Retorna os dados cadastrais de um servidor específico."""
     guild = await db.get(Guild, guild_id)
@@ -105,7 +99,7 @@ async def get_guild(
 async def get_guild_settings(
     guild_id: int, 
     db: AsyncSession = Depends(get_db),
-    user: dict = Depends(require_guild_manager)  # Proteção: Dono/Admin do servidor ou Admin do Sistema
+    user: dict = Depends(require_guild_manager) 
 ):
     """Retorna as configurações do servidor."""
     settings = await db.get(GuildSettings, guild_id)
@@ -131,7 +125,7 @@ async def update_guild_settings(
     guild_id: int, 
     payload: GuildSettingsUpdateSchema, 
     db: AsyncSession = Depends(get_db),
-    user: dict = Depends(require_guild_manager)  # Proteção: Dono/Admin do servidor ou Admin do Sistema
+    user: dict = Depends(require_guild_manager)  
 ):
     """Atualiza as configurações do servidor via Dashboard."""
     settings = await db.get(GuildSettings, guild_id)
@@ -178,7 +172,7 @@ async def toggle_guild_status(
     guild_id: int,
     payload: GuildStatusUpdateSchema,
     db: AsyncSession = Depends(get_db),
-    moderator: dict = Depends(require_system_moderator)  # Exclusivo: Moderador ou Admin do Sistema
+    moderator: dict = Depends(require_system_moderator)
 ):
     """
     Permite à staff do sistema suspender ou reativar o bot em um servidor.

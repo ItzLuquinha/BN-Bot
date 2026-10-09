@@ -74,13 +74,12 @@ async def discord_callback(code: str):
     user_id = str(user_data["id"])
     role = get_system_role(user_id)
 
-    # Gera o JWT com a role do sistema
     jwt_token = create_access_token({
         "id": user_id,
         "username": user_data["username"],
         "avatar": user_data.get("avatar"),
-        "system_role": role.value,       # "user", "moderator" ou "admin"
-        "guilds": manageable_guild_ids    # Servidores que ele administra
+        "system_role": role.value,      
+        "guilds": manageable_guild_ids    
     })
 
     return {
@@ -91,17 +90,6 @@ async def discord_callback(code: str):
             "username": user_data["username"],
             "avatar": user_data.get("avatar"),
             "system_role": role.value
-        },
-        "manageable_guilds": manageable_guild_ids
-    }
-
-    return {
-        "access_token": jwt_token,
-        "token_type": "bearer",
-        "user": {
-            "id": user_data["id"],
-            "username": user_data["username"],
-            "avatar": user_data.get("avatar")
         },
         "manageable_guilds": manageable_guild_ids
     }

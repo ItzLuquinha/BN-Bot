@@ -12,9 +12,9 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 dias
 
 class SystemRole(str, Enum):
-    USER = "user"           # Usuário comum
-    MODERATOR = "moderator" # Moderador da equipe do bot
-    ADMIN = "admin"         # Administrador geral do bot
+    USER = "user"           
+    MODERATOR = "moderator" 
+    ADMIN = "admin"         
 
 
 def get_system_role(user_id: int | str) -> SystemRole:

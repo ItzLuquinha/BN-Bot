@@ -33,16 +33,14 @@ async def require_guild_manager(
     """
     role = current_user.get("system_role")
     if role == SystemRole.ADMIN.value:
-        return current_user  # Admin do sistema tem acesso total a qualquer servidor
+        return current_user  
 
     user_id = int(current_user["id"])
     guild = await db.get(Guild, guild_id)
 
-    # Dono do servidor
     if guild and guild.owner_id == user_id:
         return current_user
 
-    # Admin do servidor (Discord)
     manageable = current_user.get("guilds", [])
     if str(guild_id) in manageable or guild_id in manageable:
         return current_user
@@ -53,7 +51,6 @@ async def require_guild_manager(
     )
 
 
-# --- TRAVA 2: Moderador do Sistema (ou Admin do Sistema) ---
 async def require_system_moderator(current_user: dict = Depends(get_current_user)) -> dict:
     """Permite acesso a Moderadores ou Administradores do Sistema."""
     role = current_user.get("system_role")
@@ -66,7 +63,6 @@ async def require_system_moderator(current_user: dict = Depends(get_current_user
     )
 
 
-# --- TRAVA 3: Apenas Administrador Supremo do Sistema ---
 async def require_system_admin(current_user: dict = Depends(get_current_user)) -> dict:
     """Permite acesso EXCLUSIVO a Administradores do Sistema."""
     role = current_user.get("system_role")
