@@ -13,3 +13,10 @@ itsdangerous>=2.2,<3
 pydantic-settings==2.15.0
 python-multipart>=0.0.20,<1
 tzdata>=2025.2
+fastapi
+uvicorn[standard]
+sqlalchemy
+asyncpg
+python-dotenv
+httpx
+pyjwt[crypto]
