@@ -1,0 +1,104 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-bn-dark text-white min-h-screen antialiased;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  }
+}
+
+/* Scrollbar personalizada dark */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0B0F17;
+}
+::-webkit-scrollbar-thumb {
+  background: #1E2B45;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #22C55E;
+}
+
+/* Animação com grandes deslocamentos pela tela */
+@keyframes roam-green {
+  0% {
+    transform: translate(0vw, 0vh) scale(1);
+    opacity: 0.18;
+  }
+  25% {
+    transform: translate(35vw, 20vh) scale(1.2);
+    opacity: 0.28;
+  }
+  50% {
+    transform: translate(15vw, 55vh) scale(0.95);
+    opacity: 0.16;
+  }
+  75% {
+    transform: translate(-10vw, 30vh) scale(1.15);
+    opacity: 0.24;
+  }
+  100% {
+    transform: translate(0vw, 0vh) scale(1);
+    opacity: 0.18;
+  }
+}
+
+@keyframes roam-blue {
+  0% {
+    transform: translate(0vw, 0vh) scale(1);
+    opacity: 0.16;
+  }
+  30% {
+    transform: translate(-40vw, -25vh) scale(1.25);
+    opacity: 0.26;
+  }
+  60% {
+    transform: translate(-25vw, 30vh) scale(0.9);
+    opacity: 0.14;
+  }
+  85% {
+    transform: translate(10vw, 15vh) scale(1.1);
+    opacity: 0.22;
+  }
+  100% {
+    transform: translate(0vw, 0vh) scale(1);
+    opacity: 0.16;
+  }
+}
+
+@keyframes roam-gold {
+  0% {
+    transform: translate(0vw, 0vh) scale(1);
+    opacity: 0.14;
+  }
+  35% {
+    transform: translate(-20vw, -45vh) scale(1.2);
+    opacity: 0.25;
+  }
+  70% {
+    transform: translate(25vw, -30vh) scale(0.85);
+    opacity: 0.12;
+  }
+  100% {
+    transform: translate(0vw, 0vh) scale(1);
+    opacity: 0.14;
+  }
+}
+
+/* Tempos suaves para o deslocamento ser elegante e relaxante */
+.animate-blob-green {
+  animation: roam-green 18s ease-in-out infinite;
+}
+
+.animate-blob-blue {
+  animation: roam-blue 22s ease-in-out infinite;
+}
+
+.animate-blob-gold {
+  animation: roam-gold 20s ease-in-out infinite;
+}
