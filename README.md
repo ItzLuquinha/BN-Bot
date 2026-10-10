@@ -24,7 +24,7 @@ npm --prefix web ci
 ```
 Instala as dependências do dashboard.
 
-Configure as variáveis de ambiente necessárias antes de iniciar os serviços.
+Configure as variáveis de ambiente necessárias antes de iniciar.
 
 ## Inicialização
 
