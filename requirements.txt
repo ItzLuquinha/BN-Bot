@@ -20,3 +20,6 @@ asyncpg
 python-dotenv
 httpx
 pyjwt[crypto]
+PyJWT[crypto]>=2.10,<3
+
+yt-dlp[default,curl-cffi]>=2026.8.19.dev0,<2027

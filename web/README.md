@@ -1,16 +1,24 @@
-# React + Vite
+# Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Execute na raiz do projeto.
 
-Currently, two official plugins are available:
+```powershell
+npm --prefix web ci
+```
+Instala as dependências.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```powershell
+$env:VITE_API_URL = "http://localhost:8000"
+npm --prefix web run dev -- --host 127.0.0.1
+```
+Inicia o dashboard. A API deve estar ativa na porta 8000.
 
-## React Compiler
+```powershell
+npm --prefix web run lint
+```
+Executa o ESLint.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+```powershell
+npm --prefix web run build
+```
+Gera o build de produção.

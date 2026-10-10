@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     discord_client_id: str
     discord_client_secret: str
     discord_redirect_uri: str = "http://localhost:8000/auth/callback"
+    legacy_discord_redirect_uri: str = "http://localhost:8000/auth/callback"
     discord_guild_id: int | None = None
     database_url: str
     redis_url: str = "redis://localhost:6379/0"
@@ -36,9 +37,9 @@ class Settings(BaseSettings):
     @classmethod
     def validate_app_secret_key(cls, value: str) -> str:
         value = value.strip()
-        if len(value) < 32:
-            raise ValueError("APP_SECRET_KEY must contain at least 32 non-whitespace characters")
-        if value.casefold() in {"change-me", "changeme", "your-secret-here", "secret-key"}:
+        if len(value) < 32 or len(set(value)) < 8:
+            raise ValueError("APP_SECRET_KEY must contain at least 32 characters with sufficient variety")
+        if value.casefold() in {"change-me", "changeme", "your-secret-here", "secret-key", "password"}:
             raise ValueError("APP_SECRET_KEY must be a randomly generated secret")
         return value
 

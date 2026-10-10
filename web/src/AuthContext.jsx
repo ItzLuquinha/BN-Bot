@@ -1,71 +1,105 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { apiRequest, apiUrl, getApiErrorMessage, ApiError } from './api/client';
+import { AuthContext } from './auth/context';
 
-const AuthContext = createContext(null);
-
-export const AuthProvider = ({ children }) => {
-  const [token, setToken] = useState(localStorage.getItem('bn_token'));
+export function AuthProvider({ children }) {
+  const [token, setToken] = useState(() => localStorage.getItem('bn_token'));
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
-
-  const API_URL = "http://localhost:8000";
+  const [authError, setAuthError] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const urlToken = params.get('token');
-
-    if (urlToken) {
-      localStorage.setItem('bn_token', urlToken);
-      setToken(urlToken);
-      window.history.replaceState({}, document.title, window.location.pathname);
-    }
+    const expireSession = () => {
+      localStorage.removeItem('bn_token');
+      setToken(null);
+      setUser(null);
+      setAuthError('Sua sessão expirou. Entre novamente com o Discord.');
+    };
+    window.addEventListener('bn:session-expired', expireSession);
+    return () => window.removeEventListener('bn:session-expired', expireSession);
   }, []);
 
   useEffect(() => {
-    if (!token) {
-      setUser(null);
-      setLoading(false);
-      return;
-    }
+    let cancelled = false;
+    Promise.resolve().then(() => {
+      if (cancelled) return;
+      const queryParams = new URLSearchParams(window.location.search);
+      const hashParams = new URLSearchParams(window.location.hash.slice(1));
+      const urlToken = hashParams.get('token') || queryParams.get('token');
+      if (urlToken) {
+        localStorage.setItem('bn_token', urlToken);
+        setToken(urlToken);
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
+      setAuthReady(true);
+    });
+    return () => { cancelled = true; };
+  }, []);
 
-    const fetchMe = async () => {
-      try {
-        const res = await fetch(`${API_URL}/api/v1/auth/me`, {
-          headers: {
-            Authorization: `Bearer ${token}`
-          }
-        });
+  useEffect(() => {
+    if (!authReady) return undefined;
+    const controller = new AbortController();
 
-        if (res.ok) {
-          const data = await res.json();
-          setUser(data);
-        } else {
-          logout();
-        }
-      } catch (err) {
-        console.error("Erro ao autenticar usuário:", err);
-      } finally {
+    const authenticate = async () => {
+      if (!token) {
+        setUser(null);
+        setAuthError(null);
         setLoading(false);
+        return;
+      }
+      setLoading(true);
+      setAuthError(null);
+      try {
+        const data = await apiRequest('/auth/me', { token, signal: controller.signal });
+        if (!controller.signal.aborted) setUser(data);
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        if (error instanceof ApiError && error.status === 401) {
+          localStorage.removeItem('bn_token');
+          setToken(null);
+          setUser(null);
+          setAuthError('Sua sessão expirou. Entre novamente com o Discord.');
+        } else {
+          setUser(null);
+          setAuthError(getApiErrorMessage(error));
+        }
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
       }
     };
 
-    fetchMe();
-  }, [token]);
+    authenticate();
+    return () => controller.abort();
+  }, [authReady, token, retryCount]);
 
-  const login = () => {
-    window.location.href = `${API_URL}/api/v1/auth/login`;
-  };
+  const login = useCallback(() => {
+    window.location.assign(apiUrl('/auth/login'));
+  }, []);
 
-  const logout = () => {
+  const logout = useCallback(async () => {
+    const activeToken = token;
     localStorage.removeItem('bn_token');
     setToken(null);
     setUser(null);
-  };
+    setAuthError(null);
+    if (activeToken) {
+      await apiRequest('/auth/logout', { method: 'POST', token: activeToken }).catch(() => undefined);
+    }
+  }, [token]);
 
-  return (
-    <AuthContext.Provider value={{ user, token, isAuthenticated: !!user, loading, login, logout }}>
-      {children}
-    </AuthContext.Provider>
-  );
-};
+  const retryAuthentication = useCallback(() => setRetryCount((current) => current + 1), []);
+  const value = useMemo(() => ({
+    user,
+    token,
+    isAuthenticated: Boolean(user),
+    loading,
+    authError,
+    login,
+    logout,
+    retryAuthentication,
+  }), [user, token, loading, authError, login, logout, retryAuthentication]);
 
-export const useAuth = () => useContext(AuthContext);
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}

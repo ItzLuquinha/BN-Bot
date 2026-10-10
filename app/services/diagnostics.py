@@ -1081,8 +1081,31 @@ def _model_sequence_alignment_check() -> DiagnosticResult:
         return DiagnosticResult("ORM IDs", False, f"{type(exc).__name__}: {str(exc)[:220]}")
 
 
+def _social_video_runtime_check(bot: Any) -> DiagnosticResult:
+    missing: list[str] = []
+    versions: list[str] = []
+    for package in ("yt-dlp", "curl-cffi"):
+        try:
+            versions.append(f"{package} {importlib.metadata.version(package)}")
+        except importlib.metadata.PackageNotFoundError:
+            missing.append(package)
+    try:
+        importlib.import_module("curl_cffi")
+    except ImportError:
+        if "curl-cffi" not in missing:
+            missing.append("curl-cffi (import curl_cffi falhou)")
+    command_names = {command.qualified_name for command in bot.tree.walk_commands()}
+    missing_commands = sorted({"instagram", "tiktok"} - command_names)
+    details = [", ".join(versions) or "dependências indisponíveis"]
+    if missing:
+        details.append("pacotes ausentes: " + ", ".join(missing))
+    if missing_commands:
+        details.append("comandos não registrados: " + ", ".join(missing_commands))
+    return DiagnosticResult("Social video", not missing and not missing_commands, " | ".join(details))
+
+
 def _dependency_check() -> DiagnosticResult:
-    required = ("discord.py", "SQLAlchemy", "greenlet", "asyncpg", "redis", "FastAPI", "alembic")
+    required = ("discord.py", "SQLAlchemy", "greenlet", "asyncpg", "redis", "FastAPI", "alembic", "yt-dlp", "curl-cffi")
     missing: list[str] = []
     versions: list[str] = []
     for package in required:
@@ -1481,6 +1504,7 @@ async def run_diagnostics(bot: Any, guild_id: int, user_id: int, channel_id: int
         _error_handling_check(),
         _model_sequence_alignment_check(),
         _dependency_check(),
+        _social_video_runtime_check(bot),
         _environment_files_check(),
         _persistent_views_check(),
         _configuration_safety_check(),

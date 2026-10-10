@@ -1,0 +1,29 @@
+Metadata-Version: 2.4
+Name: bn-bot
+Version: 0.5.20
+Summary: Discord bot for server management, moderation and community features
+Requires-Python: >=3.12
+License-File: LICENSE
+Requires-Dist: discord.py[voice]==2.7.1
+Requires-Dist: SQLAlchemy[asyncio]==2.1.3
+Requires-Dist: greenlet<4,>=3.1
+Requires-Dist: asyncpg<1,>=0.29
+Requires-Dist: psycopg[binary]<4,>=3.2
+Requires-Dist: alembic==1.20.0
+Requires-Dist: redis==8.0.0
+Requires-Dist: fastapi==0.142.2
+Requires-Dist: uvicorn[standard]<1,>=0.35
+Requires-Dist: jinja2<4,>=3.1
+Requires-Dist: httpx<1,>=0.28
+Requires-Dist: itsdangerous<3,>=2.2
+Requires-Dist: pydantic-settings==2.15.0
+Requires-Dist: python-multipart<1,>=0.0.20
+Requires-Dist: tzdata>=2025.2
+Requires-Dist: yt-dlp[curl-cffi,default]<2027,>=2026.8.19.dev0
+Provides-Extra: dev
+Requires-Dist: pytest<10,>=8.4; extra == "dev"
+Requires-Dist: pytest-asyncio<2,>=1.2; extra == "dev"
+Requires-Dist: aiosqlite<1,>=0.21; extra == "dev"
+Requires-Dist: ruff<1,>=0.13; extra == "dev"
+Requires-Dist: mypy<2,>=1.18; extra == "dev"
+Dynamic: license-file

@@ -1,9 +1,8 @@
-import React from 'react';
-import { useAuth } from '../AuthContext';
+import { useAuth } from '../auth/useAuth';
 import { useNavigate } from 'react-router-dom';
 import { 
   Shield, Sparkles, Zap, ArrowRight, LayoutDashboard, 
-  Database, LogOut, User, MessageSquare, ExternalLink, Bot
+  Database, LogOut, User, ExternalLink, Bot
 } from 'lucide-react';
 
 export default function HomePage() {
@@ -17,15 +16,15 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen flex flex-col bg-bn-dark relative overflow-hidden select-none">
-{/* Luzes de fundo animadas com as cores da logo */}
+
       <div className="absolute -top-40 -left-40 w-[30rem] h-[30rem] bg-bn-green rounded-full blur-[100px] pointer-events-none animate-blob-green" />
       <div className="absolute top-1/3 -right-40 w-[32rem] h-[32rem] bg-bn-blue rounded-full blur-[110px] pointer-events-none animate-blob-blue" />
       <div className="absolute -bottom-40 left-1/3 w-[28rem] h-[28rem] bg-bn-gold rounded-full blur-[90px] pointer-events-none animate-blob-gold" />
 
-      {/* Navbar Superior */}
+      
       <header className="border-b border-bn-border/60 bg-bn-dark/80 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
-          {/* Logo Brand */}
+          
           <div className="flex items-center gap-3">
             <div className="w-11 h-11 rounded-xl bg-bn-card flex items-center justify-center border border-bn-border relative shadow-inner">
               <span className="font-extrabold text-lg text-white">B</span>
@@ -42,13 +41,13 @@ export default function HomePage() {
             </div>
           </div>
 
-          {/* Links e Área de Usuário */}
+          
           <div className="flex items-center gap-4">
             {loading ? (
               <span className="text-xs text-bn-muted animate-pulse">Verificando sessão...</span>
             ) : isAuthenticated ? (
               <div className="flex items-center gap-3">
-                {/* Botão de Atalho para os Servidores */}
+                
                 <button
                   onClick={() => navigate('/servers')}
                   className="hidden sm:flex items-center gap-2 px-4 py-2 rounded-xl bg-bn-green/15 text-bn-green border border-bn-green/30 hover:bg-bn-green hover:text-bn-dark font-bold text-xs transition-all cursor-pointer"
@@ -57,7 +56,7 @@ export default function HomePage() {
                   <span>Meus Servidores</span>
                 </button>
 
-                {/* Perfil do Usuário */}
+                
                 <div className="flex items-center gap-3 bg-bn-card border border-bn-border px-3.5 py-1.5 rounded-xl shadow-sm">
                   {getAvatarUrl(user) ? (
                     <img src={getAvatarUrl(user)} alt="Avatar" className="w-8 h-8 rounded-full border border-bn-green" />
@@ -74,7 +73,7 @@ export default function HomePage() {
                   </div>
                 </div>
 
-                {/* Sair */}
+                
                 <button 
                   onClick={logout}
                   title="Sair da Conta"
@@ -96,15 +95,15 @@ export default function HomePage() {
         </div>
       </header>
 
-      {/* Conteúdo Principal (Hero Section) */}
+      
       <main className="flex-1 max-w-7xl mx-auto px-6 py-16 flex flex-col justify-center items-center text-center z-10">
-        {/* Badge no topo */}
+        
         <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-bn-card border border-bn-border text-bn-gold text-xs font-semibold mb-8 shadow-sm">
           <Sparkles className="w-3.5 h-3.5" />
           <span>Gestão Inteligente & Automação para Discord</span>
         </div>
 
-        {/* Título com degradê das cores da logo */}
+        
         <h1 className="text-5xl md:text-6xl font-extrabold tracking-tight text-white max-w-4xl leading-[1.15]">
           O controle do seu servidor nas suas mãos com o{' '}
           <span className="text-transparent bg-clip-text bg-gradient-to-r from-bn-green via-bn-gold to-bn-blue">
@@ -112,12 +111,12 @@ export default function HomePage() {
           </span>
         </h1>
 
-        {/* Subtítulo */}
+        
         <p className="mt-6 text-lg text-bn-muted max-w-2xl leading-relaxed">
           Configure regras de AutoMod, gerencie economia personalizada, acompanhe métricas de atividade e puna infratores com um painel web intuitivo em tempo real.
         </p>
 
-        {/* Ações Centrais */}
+        
         <div className="mt-10 flex flex-wrap gap-4 justify-center items-center">
           {isAuthenticated ? (
             <button 
@@ -148,9 +147,9 @@ export default function HomePage() {
           </a>
         </div>
 
-        {/* Grade de Destaques / Features */}
+        
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-20 w-full text-left">
-          {/* Card 1: AutoMod */}
+          
           <div className="p-6 rounded-2xl bg-bn-card border border-bn-border hover:border-bn-green/40 transition-all hover:bg-bn-cardHover group">
             <div className="w-12 h-12 rounded-xl bg-bn-green/10 text-bn-green flex items-center justify-center mb-5 group-hover:scale-110 transition-transform">
               <Shield className="w-6 h-6" />
@@ -161,7 +160,7 @@ export default function HomePage() {
             </p>
           </div>
 
-          {/* Card 2: Economia */}
+          
           <div className="p-6 rounded-2xl bg-bn-card border border-bn-border hover:border-bn-gold/40 transition-all hover:bg-bn-cardHover group">
             <div className="w-12 h-12 rounded-xl bg-bn-gold/10 text-bn-gold flex items-center justify-center mb-5 group-hover:scale-110 transition-transform">
               <Zap className="w-6 h-6" />
@@ -172,7 +171,7 @@ export default function HomePage() {
             </p>
           </div>
 
-          {/* Card 3: Auditoria & Logs */}
+          
           <div className="p-6 rounded-2xl bg-bn-card border border-bn-border hover:border-bn-blue/40 transition-all hover:bg-bn-cardHover group">
             <div className="w-12 h-12 rounded-xl bg-bn-blue/10 text-bn-blue flex items-center justify-center mb-5 group-hover:scale-110 transition-transform">
               <Database className="w-6 h-6" />
@@ -185,7 +184,7 @@ export default function HomePage() {
         </div>
       </main>
 
-      {/* Footer simples */}
+      
       <footer className="border-t border-bn-border/60 py-8 text-center text-xs text-bn-muted z-10">
         <p>© 2026 BN Bot. Todos os direitos reservados.</p>
       </footer>

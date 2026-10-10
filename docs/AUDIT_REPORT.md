@@ -3,9 +3,19 @@
 **Data:** 9 de outubro de 2026  
 **Escopo:** código Python, comandos e eventos Discord, painel FastAPI, OAuth/sessões, frontend estático, workers, serviços, modelos SQLAlchemy, migrações, scripts, documentação e testes. Arquivos `.env` e variantes com segredos não foram abertos nem incluídos no pacote corrigido.
 
-## Resumo
+## Resumo atualizado da auditoria
 
-Foram corrigidos problemas identificados na inspeção estática e nos testes. As mudanças principais reduzem chamadas repetidas à API do Discord, tornam as tentativas após falhas finitas e consertam o ciclo de vida do Anti-Raid para impedir que o worker remova um lockdown antes de expirar.
+Além das correções de workers e comandos descritas nas seções históricas abaixo, esta revisão corrigiu a superfície de autenticação e autorização da API REST e integrou o dashboard React aos serviços persistidos do projeto. O dashboard React (`web/`) com FastAPI (`api/`) é a implementação oficial para novas instalações; o dashboard legado permanece disponível explicitamente para compatibilidade.
+
+- JWT sem segredo padrão: a API falha na inicialização se `APP_SECRET_KEY` for ausente/fraca e aceita apenas `HS256`, com claims obrigatórias e validação de expiração/identidade.
+- OAuth da API: `state` aleatório vinculado à sessão, expirável e consumido no callback; callbacks ausentes, inválidos, cancelados e reutilizados são rejeitados.
+- CORS explícito, sem curingas nem credenciais cross-origin; produção exige HTTPS e coerência entre domínio do dashboard e origens autorizadas.
+- Autorização por guilda aplicada no backend, com papéis globais derivados de allowlists de IDs; moderator não recebe privilégio global implicitamente.
+- Cliente HTTP React centralizado, estados distintos de carregamento/erro/permissão/lista vazia, tabs para membros, economia/moderação e auditoria, e AutoMod integrado aos modelos de configuração persistidos existentes.
+- Validação de `timezone` com `zoneinfo` e de `locale` com idiomas suportados; mudanças de configuração geram trilha de auditoria.
+- `.env` não foi aberto, lido, alterado ou incluído no pacote final. `.gitignore` e `.dockerignore` excluem arquivos locais de ambiente; apenas exemplos sem segredos são distribuídos.
+
+As seções seguintes preservam o registro de correções anteriores do bot e das tarefas de manutenção.
 
 ## Bugs encontrados e correções aplicadas
 
@@ -90,16 +100,14 @@ A causa do limite antigo no menu slash era adicional: o comparador entre comando
 
 A API permite no máximo 100 mensagens por chamada de exclusão em massa, e mensagens com mais de 14 dias não podem usar esse endpoint; o `purge` pode precisar excluir mensagens antigas individualmente. Isso significa que selecionar 1000 é um limite de mensagens a analisar/remover, não uma única chamada ao Discord. Referências: [Discord API](https://discord.com/developers/docs/resources/message#bulk-delete-messages) e [discord.py](https://discordpy.readthedocs.io/en/stable/api.html#discord.abc.Messageable.purge).
 
-## Autenticação e autorização: verificações realizadas
+## Autenticação e autorização: verificações desta revisão
 
-- O estado OAuth é conferido e consumido no callback; a sessão usa um identificador opaco armazenado no Redis e a chave é removida quando expira ou é inválida.
-- O painel verifica acesso à guilda e permissões do Discord antes de devolver dados.
-- Rotas de mutação do painel verificam o token CSRF.
-- A configuração de sessão usa cookie assinado, `SameSite=Lax` e `Secure` em produção; URLs de redirect/dashboard precisam de HTTPS quando `APP_ENV=production`.
-- O código distingue sessão OAuth expirada, falta de permissão, indisponibilidade do Discord e rate limit.
-- As políticas de permissões dos comandos e os limites de superfície de comando foram auditados; as verificações de hierarquia de cargos devem falhar de forma segura se não puderem ser confirmadas.
-
-Não foi realizado login contra uma aplicação Discord real; portanto, a revisão de autenticação foi estática e não comprova a configuração externa do Developer Portal, scopes, intents ou URLs de produção.
+- JWT usa `APP_SECRET_KEY` validada, algoritmo `HS256` explícito, `iss`, `aud`, `sub`, `iat`, `nbf`, `exp` e `jti`. Tokens expirados, com assinatura inválida, payload adulterado ou claims fora do contrato são rejeitados.
+- O papel de sistema é recalculado no backend a partir de `SYSTEM_ADMIN_IDS` e `SYSTEM_MOD_IDS`; a claim declarada no token não basta para conceder acesso global.
+- O OAuth React consome `state` de uso único no callback, valida o código/perfil/lista de servidores do Discord e não cria um token quando o estado falha, o login é cancelado ou a resposta externa não é válida. O estado é armazenado na sessão assinada da API; a implementação legada conserva seu próprio fluxo, usando `LEGACY_DISCORD_REDIRECT_URI`.
+- A API aplica autorização no servidor para leitura e alteração de cada guilda. O proprietário, usuários autorizados para aquela guilda e administradores globais válidos seguem caminhos separados; moderadores globais sem direito sobre a guilda não ganham acesso automaticamente. Guildas inexistentes/inativas são recusadas sem listar os seus dados.
+- CORS aceita apenas origens configuradas, métodos/cabeçalhos necessários e não usa `allow_credentials=True`. A aplicação recusa curingas; em produção URLs de dashboard, callback e origens precisam de HTTPS.
+- Os testes automatizados incluem ausência/chave fraca, algoritmo inválido, token expirado/adulterado/assinatura inválida, tentativa de forjar papel admin, políticas de acesso por guilda, state ausente/inválido/reutilizado e callback válido. O callback bem-sucedido usa mock somente na fronteira HTTP do Discord; não representa um login contra o serviço real.
 
 ## Rate limits: o que foi reduzido
 
@@ -111,19 +119,19 @@ Não foi realizado login contra uma aplicação Discord real; portanto, a revis�
 
 O projeto não pode garantir que jamais receberá HTTP 429: os limites dependem do uso global, dos buckets da rota e de outras operações da aplicação. A recomendação é continuar usando as abstrações oficiais do `discord.py`, respeitar seus atrasos e não implementar retries imediatos fora dessas políticas. Referência: [documentação oficial de rate limits do Discord](https://discord.com/developers/docs/topics/rate-limits).
 
-## Validação executada
+## Validação executada nesta revisão
 
-- `python -m compileall -q app scripts tests`: **passou**.
-- `pytest -q`: **275 testes aprovados após a limpeza**.
-- `python scripts/audit.py`: **passou**.
-- `python scripts/security_audit.py`: **passou**; as políticas de comandos protegidos e superfícies com rate limit foram verificadas.
-- `python scripts/command_matrix.py`: **passou**, com 89 handlers auditados individualmente.
-- `python -m alembic upgrade head --sql`: **passou**, gerando SQL de atualização para a cadeia completa de 13 revisões, incluindo as migrações novas.
-- Importação das 54 tabelas SQLAlchemy e verificação do índice Anti-Raid: **passou**.
+- `python -m compileall -q api app tests scripts main.py`: **passou**.
+- `python scripts/audit.py`: **passou** (`BN Bot audit passed`).
+- `python -m pytest -q`: **307 testes aprovados**, nenhum falhou (execução final: 4,27 s).
+- `cd web && npm run lint`: **passou**, sem warnings do ESLint.
+- `cd web && npm run build`: **não concluiu neste ambiente**. O ZIP recebido continha `node_modules` com binding nativo Windows, mas o runtime é Linux. O lockfile inclui `@rolldown/binding-linux-x64-gnu@1.2.13`; a instalação limpa não pôde obtê-lo porque o registry estava indisponível e o cache npm não continha todos os pacotes. O lockfile foi mantido intacto, e `node_modules`/`dist` foram excluídos do pacote de código.
+- Ambiente frontend verificado: Node.js `22.16.0`, npm `10.9.2`, `package-lock.json` v3, Vite `8.3.4`, Rolldown `1.2.13`.
+- O ZIP final foi verificado para não incluir `.env`, variantes `.env.*` fora dos exemplos, diretórios `node_modules`, `dist`, ambientes virtuais, caches ou bytecode.
 
-### Limitação do ambiente de teste
+### Limitações da validação
 
-A validação estática e a suíte automatizada não substituem um teste de inicialização conectado ao Discord e aos serviços reais.
+Não foi possível provar um fluxo ponta a ponta com PostgreSQL, Redis ou Discord reais neste ambiente; nenhuma credencial real foi usada. Os testes verificam a lógica de autenticação/autorização e contratos locais, mas o login OAuth externo e a leitura/gravação em uma instância real do banco ainda precisam de uma execução de integração no ambiente de implantação. O build de produção do React deve ser repetido após uma instalação limpa em sistema compatível e com acesso ao registry npm.
 
 ## Melhorias recomendadas
 

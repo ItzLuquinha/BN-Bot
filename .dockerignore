@@ -3,4 +3,13 @@
 __pycache__
 .pytest_cache
 .env
+.env.*
+!.env.example
 *.log
+web/node_modules
+web/dist
+web/.env.local
+web/.env.*.local
+web/.env.*
+!web/.env.example
+web/dist-ssr

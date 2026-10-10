@@ -1,7 +1,6 @@
-import React from 'react';
 import { 
   Home, Settings, ShieldAlert, Shield, 
-  Coins, FileText, ChevronLeft, Bell, Users
+  Coins, FileText, ChevronLeft, Users
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
@@ -35,7 +34,7 @@ export default function Sidebar({ currentTab, setCurrentTab, guild }) {
 
   return (
     <aside className="w-64 bg-bn-card border-r border-bn-border flex flex-col h-screen sticky top-0">
-      {/* Botão de Voltar para os Servidores */}
+      
       <div className="p-4 border-b border-bn-border">
         <button 
           onClick={() => navigate('/servers')}
@@ -45,7 +44,7 @@ export default function Sidebar({ currentTab, setCurrentTab, guild }) {
           <span>Trocar de Servidor</span>
         </button>
 
-        {/* Servidor Ativo */}
+        
         <div className="mt-3 flex items-center gap-3 p-2 rounded-xl bg-bn-dark/60 border border-bn-border">
           {guild?.icon_url ? (
             <img src={guild.icon_url} alt="" className="w-8 h-8 rounded-lg" />
@@ -58,7 +57,7 @@ export default function Sidebar({ currentTab, setCurrentTab, guild }) {
         </div>
       </div>
 
-      {/* Menus */}
+      
       <div className="flex-1 overflow-y-auto p-4 space-y-6">
         {menuSections.map((section, idx) => (
           <div key={idx}>

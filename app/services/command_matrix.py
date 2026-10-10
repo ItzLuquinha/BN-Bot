@@ -33,7 +33,7 @@ EXPECTED_COMMANDS = {
     "antiraid configure", "antiraid disable", "antiraid enable", "antiraid setup", "antiraid status", "antiraid unlock",
     "automod disable", "automod enable", "automod list-action", "automod list-add", "automod list-remove", "automod lists",
     "automod rule-add", "automod rule-delete", "automod rule-update", "automod rules", "automod setup", "automod status",
-    "avatar", "balance", "ban", "bank", "botinfo", "buy", "clearwarns", "community-config", "daily", "dashboard",
+    "avatar", "balance", "ban", "bank", "botinfo", "buy", "clearwarns", "community-config", "daily", "dashboard", "instagram", "tiktok",
     "deposit", "giveaway cancel", "giveaway create", "giveaway end", "giveaway reroll", "history", "inventory", "tutorial", "job", "jobs",
     "kick", "leaderboard", "pay", "ping", "poll create", "poll end", "profile", "purge", "remind", "rep", "report",
     "report-status", "reps", "sell", "serverinfo", "shop", "suggest", "suggestion-status", "testall", "ticket",

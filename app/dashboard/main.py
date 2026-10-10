@@ -6,13 +6,13 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import json
 import secrets
 from app.core.redis import redis_client
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,14 +27,38 @@ from app.services.community import set_ticket_status, update_report, update_sugg
 from app.models import AuditLog, AutoModListEntry, AutoModRule, Guild, GuildSettings, Member, EconomyAccount, Experience, Reputation, Ticket, TicketEvent, Suggestion, Report, Giveaway, GiveawayEntry, Poll, PollVote
 
 settings = get_settings()
+if settings.app_env == "production" and urlparse(settings.legacy_discord_redirect_uri).scheme != "https":
+    raise RuntimeError("LEGACY_DISCORD_REDIRECT_URI must use HTTPS in production")
 app = FastAPI(title="BN Bot Dashboard")
 app.add_middleware(SessionMiddleware, secret_key=settings.app_secret_key, https_only=settings.app_env == "production", same_site="lax", session_cookie="bn_session")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 class GuildSettingsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     timezone: str = Field(min_length=1, max_length=64)
     locale: str = Field(min_length=2, max_length=16)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Timezone cannot be empty")
+        try:
+            ZoneInfo(normalized)
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            raise ValueError("Timezone must be a valid IANA timezone") from None
+        return normalized
+
+    @field_validator("locale")
+    @classmethod
+    def validate_locale(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized not in {"pt-BR", "en-US"}:
+            raise ValueError("Locale must be pt-BR or en-US")
+        return normalized
 
 class AutoModStatusInput(BaseModel):
     enabled: bool
@@ -146,7 +170,7 @@ async def _active_manageable_guilds(guilds: Any) -> list[dict[str, Any]]:
     return [guild for guild in manageable if str(guild.get("id", "")).isdigit() and int(guild["id"]) in active_ids]
 
 async def discord_token(code: str) -> dict[str, Any]:
-    data = {"client_id": settings.discord_client_id, "client_secret": settings.discord_client_secret, "grant_type": "authorization_code", "code": code, "redirect_uri": settings.discord_redirect_uri}
+    data = {"client_id": settings.discord_client_id, "client_secret": settings.discord_client_secret, "grant_type": "authorization_code", "code": code, "redirect_uri": settings.legacy_discord_redirect_uri}
     try:
         async with httpx.AsyncClient(base_url="https://discord.com/api/v10", timeout=10) as client:
             response = await client.post("/oauth2/token", data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -256,7 +280,7 @@ async def index(request: Request):
 async def auth_login(request: Request):
     state = new_state()
     store_oauth_state(request.session, state)
-    query = urlencode({"client_id": settings.discord_client_id, "response_type": "code", "redirect_uri": settings.discord_redirect_uri, "scope": "identify guilds", "state": state})
+    query = urlencode({"client_id": settings.discord_client_id, "response_type": "code", "redirect_uri": settings.legacy_discord_redirect_uri, "scope": "identify guilds", "state": state})
     return RedirectResponse(f"https://discord.com/oauth2/authorize?{query}")
 
 @app.get("/auth/callback")
@@ -376,17 +400,12 @@ async def update_settings(request: Request, guild_id: int, payload: GuildSetting
     settings_row = await session.get(GuildSettings, guild_id)
     if settings_row is None:
         raise HTTPException(status_code=404, detail="Guild settings not found")
-    timezone_name = payload.timezone.strip()
-    locale_name = payload.locale.strip()
-    if not timezone_name or len(locale_name) < 2:
-        raise HTTPException(status_code=422, detail="Timezone and locale are required")
-    try:
-        ZoneInfo(timezone_name)
-    except (TypeError, ValueError, ZoneInfoNotFoundError):
-        raise HTTPException(status_code=422, detail="Invalid timezone") from None
-    settings_row.timezone = timezone_name
-    settings_row.locale = locale_name
+    before = {"timezone": settings_row.timezone, "locale": settings_row.locale}
+    settings_row.timezone = payload.timezone
+    settings_row.locale = payload.locale
     settings_row.updated_at = datetime.now(timezone.utc)
+    after = {"timezone": settings_row.timezone, "locale": settings_row.locale}
+    await _dashboard_audit(request, session, guild_id, "guild.settings_update", "settings", before, after)
     await session.commit()
     return {"timezone": settings_row.timezone, "locale": settings_row.locale}
 

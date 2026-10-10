@@ -2,12 +2,13 @@ from pathlib import Path
 import ast
 
 ROOT = Path(__file__).parents[1]
-SKIP_DIRS = {".git", ".venv", "venv", "site-packages", "__pycache__", ".pytest_cache"}
+SKIP_DIRS = {".git", ".venv", "venv", "site-packages", "__pycache__", ".pytest_cache", "node_modules", "dist", "dist-ssr", "build", ".next", ".vite"}
 SKIP_FILES = {".env", ".env.local", ".env.development", ".env.test", ".env.production"}
 
 
 def should_skip(path: Path) -> bool:
-    return path.name in SKIP_FILES or any(part in SKIP_DIRS for part in path.parts)
+    is_environment_file = path.name == ".env" or (path.name.startswith(".env.") and path.name != ".env.example")
+    return is_environment_file or path.name in SKIP_FILES or any(part in SKIP_DIRS for part in path.parts)
 
 
 def python_audit() -> list[str]:

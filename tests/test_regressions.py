@@ -459,11 +459,13 @@ def test_reward_claim_insert_and_wallet_credit_share_savepoint() -> None:
     assert "await add_wallet(" in block
 
 
-def test_dashboard_rejects_invalid_timezone_and_updates_timestamp() -> None:
+def test_dashboard_rejects_invalid_timezone_locale_and_updates_timestamp() -> None:
     source = Path("app/dashboard/main.py").read_text(encoding="utf-8")
-    assert "ZoneInfo(timezone_name)" in source
-    assert 'raise HTTPException(status_code=422, detail="Invalid timezone")' in source
+    assert "ZoneInfo(normalized)" in source
+    assert 'raise ValueError("Timezone must be a valid IANA timezone")' in source
+    assert 'raise ValueError("Locale must be pt-BR or en-US")' in source
     assert "settings_row.updated_at = datetime.now(timezone.utc)" in source
+    assert '"guild.settings_update"' in source
 
 
 def test_activity_endpoint_scopes_top_channels_to_requested_period() -> None:
@@ -1003,8 +1005,9 @@ def test_project_python_source_has_no_comments() -> None:
     import tokenize
     root = Path(".")
     comments = []
+    generated_dirs = {".venv", "venv", "site-packages", "node_modules", "dist", "dist-ssr", "build", ".git", "__pycache__", ".pytest_cache"}
     for path in root.rglob("*.py"):
-        if any(part in {".venv", "venv", "site-packages"} for part in path.parts):
+        if any(part in generated_dirs for part in path.parts):
             continue
         text = path.read_text(encoding="utf-8")
         for token in tokenize.generate_tokens(io.StringIO(text).readline):

@@ -1,5 +1,4 @@
-import React from 'react';
-import { useAuth } from '../AuthContext';
+import { useAuth } from '../auth/useAuth';
 import { LogOut, User } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 

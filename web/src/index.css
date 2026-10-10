@@ -9,7 +9,7 @@
   }
 }
 
-/* Scrollbar personalizada dark */
+                                  
 ::-webkit-scrollbar {
   width: 8px;
 }
@@ -24,7 +24,7 @@
   background: #22C55E;
 }
 
-/* Animação com grandes deslocamentos pela tela */
+                                                  
 @keyframes roam-green {
   0% {
     transform: translate(0vw, 0vh) scale(1);
@@ -90,7 +90,7 @@
   }
 }
 
-/* Tempos suaves para o deslocamento ser elegante e relaxante */
+                                                                
 .animate-blob-green {
   animation: roam-green 18s ease-in-out infinite;
 }

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import io
 import logging
 import secrets
 import time
@@ -16,6 +17,7 @@ from app.core.time import utc_now
 from app.discord.theme import embed, duration, number, ledger, status_line
 from app.discord.app_contexts import user_installable
 from app.services.permissions import required_permission_text
+from app.services.social_video import SocialVideoError, download_social_video, validate_social_video_url
 
 from app.services.rate_limits import command_rate_limit
 logger = logging.getLogger("bn_bot.discord.utility")
@@ -487,6 +489,45 @@ class UtilityCog(commands.Cog):
 
         page = embed("BN / HISTÓRICO", "\n".join(lines), "system")
         await respond(interaction, embed=page, ephemeral=True)
+
+    async def _publish_social_video(self, interaction: discord.Interaction, url: str, platform: str) -> None:
+        await defer(interaction, ephemeral=True)
+        try:
+            safe_url = validate_social_video_url(url, platform)
+            video = await download_social_video(safe_url, platform)
+        except SocialVideoError as exc:
+            await respond(interaction, str(exc), ephemeral=True)
+            return
+        except Exception:
+            logger.exception("social video command failed platform=%s guild=%s", platform, interaction.guild_id)
+            await respond(interaction, "Não foi possível processar o vídeo agora. Tente novamente mais tarde.", ephemeral=True)
+            return
+
+        attachment = discord.File(io.BytesIO(video.data), filename=video.filename)
+        try:
+            await respond(
+                interaction,
+                f"Vídeo processado ({video.size_bytes / (1024 * 1024):.1f} MB).",
+                file=attachment,
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            logger.warning("social video upload rejected platform=%s size_bytes=%s guild=%s", platform, video.size_bytes, interaction.guild_id)
+            await respond(interaction, "O Discord recusou o anexo. O limite de envio deste servidor pode ser menor que o tamanho do vídeo.", ephemeral=True)
+
+    @command_rate_limit("instagram-video", 15)
+    @app_commands.command(name="instagram", description="Baixa um Reel ou publicação pública do Instagram e envia o vídeo no Discord.")
+    @app_commands.guild_only()
+    @app_commands.describe(url="Link público HTTPS de um Reel ou publicação do Instagram")
+    async def instagram(self, interaction: discord.Interaction, url: str) -> None:
+        await self._publish_social_video(interaction, url, "instagram")
+
+    @command_rate_limit("tiktok-video", 15)
+    @app_commands.command(name="tiktok", description="Baixa um vídeo público do TikTok e envia o vídeo no Discord.")
+    @app_commands.guild_only()
+    @app_commands.describe(url="Link HTTPS público de um vídeo do TikTok")
+    async def tiktok(self, interaction: discord.Interaction, url: str) -> None:
+        await self._publish_social_video(interaction, url, "tiktok")
 
     @command_rate_limit("testall", 30)
     @app_commands.command(name="testall", description="Executa um diagnóstico não destrutivo do BN Bot.")

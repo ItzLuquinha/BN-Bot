@@ -2,12 +2,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 CODE_SUFFIXES = {".py", ".html", ".css", ".js", ".ts", ".sql", ".toml", ".yml", ".yaml"}
+GENERATED_DIRS = {".venv", "venv", "site-packages", "node_modules", "dist", "build", ".git", "__pycache__", ".pytest_cache"}
+
+
+def _is_generated(path: Path) -> bool:
+    return any(part in GENERATED_DIRS for part in path.parts)
 
 
 def test_project_has_no_em_dash() -> None:
     offenders = []
     for path in ROOT.rglob("*"):
-        if any(part in {".venv", "venv", "site-packages"} for part in path.parts):
+        if _is_generated(path):
             continue
         if path.is_file() and path.suffix in CODE_SUFFIXES:
             if chr(0x2014) in path.read_text(encoding="utf-8"):
@@ -18,6 +23,8 @@ def test_project_has_no_em_dash() -> None:
 def test_project_has_no_css_gradients() -> None:
     offenders = []
     for path in ROOT.rglob("*.css"):
+        if _is_generated(path):
+            continue
         text = path.read_text(encoding="utf-8").lower()
         if "gradient(" in text:
             offenders.append(str(path.relative_to(ROOT)))
@@ -27,7 +34,7 @@ def test_project_has_no_css_gradients() -> None:
 def test_source_has_no_comments() -> None:
     offenders = []
     for path in ROOT.rglob("*.py"):
-        if any(part in {".venv", "venv", "site-packages"} for part in path.parts):
+        if _is_generated(path):
             continue
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if line.lstrip().startswith("#"):
